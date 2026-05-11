@@ -2,4 +2,3 @@ requests
 pandas
 gspread
 google-auth
-openpyxl
