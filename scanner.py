@@ -781,9 +781,6 @@ def resolve_history_results(sheet):
 
 def main():
     print("Starte Polymarket Scanner...")
-    update_history_summary(sheet, df)
-    update_outcome_history(sheet, df)
-    resolve_outcome(sheet)
 
     df = build_opportunities()
     print("Gefundene Zeilen:", len(df))
@@ -809,6 +806,9 @@ def main():
         ["Min ROI", MIN_RAW_ROI],
         ["Min History ROI %", MIN_HISTORY_ROI],
     ], range_name="A1")
+    update_history_summary(sheet, df)
+    update_outcome_history(sheet, df)
+    resolve_outcome(sheet)
 
     print("✅ Google Sheet erfolgreich aktualisiert.")
 
