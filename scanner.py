@@ -635,7 +635,6 @@ def update_outcome_history(sheet, df):
         combined.sort_values("ROI %", ascending=False)
         .drop_duplicates(subset=["Event Slug"], keep="first")
         )
-    )
 
     ws.clear()
     ws.update(
