@@ -12,7 +12,7 @@ from google.oauth2.service_account import Credentials
 
 BANKROLL = 100
 TOP_N = 5
-MIN_RAW_ROI = -1
+MIN_RAW_ROI = 0.05
 MIN_HISTORY_ROI = 5.0
 
 EVENT_LIMIT = 250
