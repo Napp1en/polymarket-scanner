@@ -580,6 +580,111 @@ def update_history_summary(sheet, df):
     ws.freeze(rows=1)
     ws.set_basic_filter()
 
+def update_outcome_history(sheet, df):
+    if df.empty:
+        return
+
+    ws = get_or_create_worksheet(sheet, "Outcome", rows=2000, cols=25)
+
+    try:
+        existing = pd.DataFrame(ws.get_all_records())
+    except Exception:
+        existing = pd.DataFrame()
+
+    rows = []
+
+    grouped = df.groupby(["Event", "Event Slug"], dropna=False)
+
+    for (event, slug), group in grouped:
+        roi = float(group["ROI %"].iloc[0])
+
+        if roi < MIN_HISTORY_ROI:
+            continue
+
+        timestamp = group["Zeit"].iloc[0]
+        top_sum = float(group[f"Summe Top {TOP_N}"].iloc[0])
+        link = group["Link"].iloc[0]
+
+        teams = " | ".join(
+            f"{row['Team / Markt']} @ {row['YES Preis']}"
+            for _, row in group.iterrows()
+        )
+
+        rows.append({
+            "Zeit": timestamp,
+            "Event": event,
+            "Event Slug": slug,
+            "ROI %": roi,
+            f"Summe Top {TOP_N}": top_sum,
+            "Teams": teams,
+            "Gewinner": "",
+            "Top 5 gewonnen?": "",
+            "Link": link,
+        })
+
+    new_df = pd.DataFrame(rows)
+
+    if existing.empty:
+        combined = new_df
+    else:
+        combined = pd.concat([existing, new_df], ignore_index=True)
+
+    combined = combined.drop_duplicates(
+        subset=["Event Slug", "Zeit"],
+        keep="last"
+    )
+
+    ws.clear()
+    ws.update(
+        values=[combined.columns.tolist()] + combined.astype(str).values.tolist(),
+        range_name="A1"
+    )
+
+    ws.freeze(rows=1)
+    ws.set_basic_filter()
+
+def resolve_outcome(sheet):
+    ws = get_or_create_worksheet(sheet, "Outcome", rows=2000, cols=25)
+
+    try:
+        df = pd.DataFrame(ws.get_all_records())
+    except Exception:
+        return
+
+    if df.empty:
+        return
+
+    changed = False
+
+    for idx, row in df.iterrows():
+        if row.get("Top 5 gewonnen?"):
+            continue
+
+        slug = row.get("Event Slug")
+        event = fetch_event_by_slug(slug)
+
+        winner = detect_resolved_winner(event)
+
+        if not winner:
+            continue
+
+        teams = parse_team_names_from_history(row["Teams"])
+
+        winner_lower = winner.lower()
+
+        top5 = any(team in winner_lower for team in teams)
+
+        df.at[idx, "Gewinner"] = winner
+        df.at[idx, "Top 5 gewonnen?"] = "TRUE" if top5 else "FALSE"
+
+        changed = True
+
+    if changed:
+        ws.clear()
+        ws.update(
+            values=[df.columns.tolist()] + df.astype(str).values.tolist(),
+            range_name="A1"
+        )
 
 def parse_team_names_from_history(teams_text):
     teams = []
@@ -676,6 +781,9 @@ def resolve_history_results(sheet):
 
 def main():
     print("Starte Polymarket Scanner...")
+    update_history_summary(sheet, df)
+    update_outcome_history(sheet, df)
+    resolve_outcome(sheet)
 
     df = build_opportunities()
     print("Gefundene Zeilen:", len(df))
