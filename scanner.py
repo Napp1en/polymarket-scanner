@@ -114,15 +114,15 @@ def event_text(event):
 def get_event_category(event):
     text = event_text(event)
 
+    # 1v1 / Einzelmatches rausfiltern
     if any(k in text for k in EXCLUDE_KEYWORDS):
         return None
 
+    # typische Match-Fragen raus
     if " will " in text and " or " in text:
         return None
 
-    if not any(k in text for k in TOURNAMENT_WORDS):
-        return None
-
+    # Kategorie bestimmen
     for category, keywords in CATEGORIES.items():
         if any(k in text for k in keywords):
             return category
