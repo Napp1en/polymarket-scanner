@@ -629,9 +629,12 @@ def update_outcome_history(sheet, df):
     else:
         combined = pd.concat([existing, new_df], ignore_index=True)
 
-    combined = combined.drop_duplicates(
-        subset=["Event Slug", "Zeit"],
-        keep="last"
+    combined["ROI %"] = combined["ROI %"].astype(float)
+
+    combined = (
+        combined.sort_values("ROI %", ascending=False)
+        .drop_duplicates(subset=["Event Slug"], keep="first")
+        )
     )
 
     ws.clear()
