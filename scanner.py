@@ -1,15 +1,25 @@
+import os
+import json
 import requests
 import pandas as pd
+import gspread
 from datetime import datetime
-import json
+from google.oauth2.service_account import Credentials
 
+# =====================
 # Einstellungen
+# =====================
+
 BANKROLL = 100
 TOP_N = 5
-MIN_RAW_ROI = 0.05
-OUTFILE = "polymarket_cs_scanner.xlsx"
+MIN_RAW_ROI = 0.00  # 0.05 = nur ab 5% ROI
+EVENT_LIMIT = 250
+MAX_PAGES = 4
 
 EVENTS_URL = "https://gamma-api.polymarket.com/events"
+
+SHEET_ID = os.getenv("SHEET_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 KEYWORDS = [
     "counter-strike",
@@ -26,12 +36,10 @@ KEYWORDS = [
     "fissure playground",
 ]
 
-TEAMS = [
-    "falcons", "spirit", "furia", "g2", "navi", "vitality",
-    "mouz", "faze", "astralis", "liquid", "virtus.pro",
-    "the mongolz", "pain", "heroic"
-]
 
+# =====================
+# Hilfsfunktionen
+# =====================
 
 def parse_list(value):
     if isinstance(value, list):
@@ -45,80 +53,8 @@ def parse_list(value):
 
     return []
 
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
 
-
-def format_excel(outfile):
-    from openpyxl import load_workbook
-
-    wb = load_workbook(outfile)
-    ws = wb.active
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-
-    # 🎨 Header
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    for cell in ws[1]:
-        cell.fill = header_fill
-
-    # 📏 Spaltenbreite
-    widths = {
-        "A": 20,
-        "B": 35,  # Event
-        "C": 50,
-        "D": 12,
-        "E": 14,
-        "F": 10,
-        "G": 10,
-        "H": 11,
-        "I": 10,
-        "J": 14,
-        "K": 50,
-    }
-
-    for col, width in widths.items():
-        ws.column_dimensions[col].width = width
-
-    # 🎨 Farben für Events
-    event_colors = [
-        "FFF2CC",  # hellgelb
-        "DDEBF7",  # hellblau
-        "E2EFDA",  # hellgrün
-        "FCE4D6",  # orange
-        "E4DFEC",  # lila
-        "F8CBAD",  # rot/rosa
-    ]
-
-    event_column = 2  # Spalte B = Event
-    event_map = {}
-    color_index = 0
-
-    for row in range(2, ws.max_row + 1):
-        event_name = ws.cell(row=row, column=event_column).value
-
-        if event_name not in event_map:
-            event_map[event_name] = event_colors[color_index % len(event_colors)]
-            color_index += 1
-
-        fill = PatternFill("solid", fgColor=event_map[event_name])
-
-        for col in range(1, ws.max_column + 1):
-            ws.cell(row=row, column=col).fill = fill
-
-    # 💰 Zahlenformate
-    for row in range(2, ws.max_row + 1):
-        ws[f"D{row}"].number_format = "0.0000"
-        ws[f"E{row}"].number_format = "0.0000"
-        ws[f"F{row}"].number_format = "0.00"
-        ws[f"G{row}"].number_format = "$0.00"
-        ws[f"H{row}"].number_format = "$0.00"
-        ws[f"I{row}"].number_format = "$0.00"
-
-    wb.save(outfile)
-
-def get_events(limit=250, max_pages=4):
+def get_events(limit=EVENT_LIMIT, max_pages=MAX_PAGES):
     events_by_id = {}
 
     orders = [
@@ -140,7 +76,7 @@ def get_events(limit=250, max_pages=4):
                 "ascending": "false",
             }
 
-            r = requests.get(EVENTS_URL, params=params, timeout=10)
+            r = requests.get(EVENTS_URL, params=params, timeout=20)
             r.raise_for_status()
 
             batch = r.json()
@@ -172,47 +108,91 @@ def is_cs_event(event):
     return any(k in text for k in KEYWORDS)
 
 
-def is_team_market(market):
-    text = " ".join([
-        str(market.get("question", "")),
-        str(market.get("title", "")),
-        str(market.get("description", "")),
-        str(market.get("slug", "")),
-    ]).lower()
+def get_yes_price(market):
+    outcomes = parse_list(market.get("outcomes"))
+    prices = parse_list(market.get("outcomePrices"))
 
-    return any(team in text for team in TEAMS)
+    if not outcomes or not prices:
+        return None
+
+    for outcome, price in zip(outcomes, prices):
+        if str(outcome).lower() == "yes":
+            try:
+                price = float(price)
+                if price > 0:
+                    return price
+            except Exception:
+                return None
+
+    return None
 
 
-def scan():
+def connect_google_sheet():
+    if not SHEET_ID:
+        raise ValueError("SHEET_ID fehlt in Railway Variables.")
+
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON fehlt in Railway Variables.")
+
+    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    client = gspread.authorize(creds)
+
+    return client.open_by_key(SHEET_ID)
+
+
+def get_or_create_worksheet(sheet, title, rows=1000, cols=20):
+    try:
+        return sheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return sheet.add_worksheet(title=title, rows=rows, cols=cols)
+
+
+def write_dataframe_to_sheet(ws, df):
+    ws.clear()
+
+    if df.empty:
+        ws.update("A1", [["Keine passenden Spots gefunden."]])
+        return
+
+    values = [df.columns.tolist()] + df.astype(str).values.tolist()
+    ws.update("A1", values)
+
+    ws.freeze(rows=1)
+    ws.set_basic_filter()
+
+
+# =====================
+# Scanner
+# =====================
+
+def build_opportunities():
     rows = []
-    events = get_events()
 
+    events = get_events()
     print(f"Events geladen: {len(events)}")
 
     cs_events = [e for e in events if is_cs_event(e)]
     print(f"CS Events gefunden: {len(cs_events)}")
 
+    print("\nGefundene CS Events:")
+    for e in cs_events:
+        print("-", e.get("title"), "|", e.get("slug"))
+
     for event in cs_events:
         markets = event.get("markets", [])
-
         team_prices = []
 
         for market in markets:
-            outcomes = parse_list(market.get("outcomes"))
-            prices = parse_list(market.get("outcomePrices"))
+            yes_price = get_yes_price(market)
 
-            if not outcomes or not prices:
-                continue
-
-            # Polymarket Team-Märkte sind meistens: ["Yes", "No"]
-            # Wir brauchen nur den YES-Preis
-            yes_price = None
-
-            for outcome, price in zip(outcomes, prices):
-                if str(outcome).lower() == "yes":
-                    yes_price = float(price)
-
-            if yes_price is None or yes_price <= 0:
+            if yes_price is None:
                 continue
 
             team_name = (
@@ -230,7 +210,6 @@ def scan():
         if len(team_prices) < TOP_N:
             continue
 
-        # Top 5 nach höchstem YES-Preis
         team_prices.sort(key=lambda x: x["price"], reverse=True)
         top_teams = team_prices[:TOP_N]
 
@@ -241,7 +220,6 @@ def scan():
 
         roi = (1 / yes_sum) - 1
 
-        # Nur positive / gewünschte ROI-Spots
         if roi < MIN_RAW_ROI:
             continue
 
@@ -266,19 +244,36 @@ def scan():
                 "Link": "https://polymarket.com/event/" + str(event.get("slug", "")),
             })
 
-    if not rows:
-        print("Keine passenden Spots gefunden.")
-        return
-
     df = pd.DataFrame(rows)
-    df = df.sort_values(by="ROI %", ascending=False)
-    df.to_excel(OUTFILE, index=False)
-    format_excel(OUTFILE)
 
-    print(f"✅ Fertig: {OUTFILE}")
-    print(df.head(20))
+    if not df.empty:
+        df = df.sort_values(by=["ROI %", "Event"], ascending=[False, True])
+
+    return df
+
+
+def main():
+    print("Starte Polymarket CS Scanner...")
+
+    df = build_opportunities()
+
+    sheet = connect_google_sheet()
+
+    opportunities_ws = get_or_create_worksheet(sheet, "Opportunities")
+    write_dataframe_to_sheet(opportunities_ws, df)
+
+    status_ws = get_or_create_worksheet(sheet, "Status", rows=20, cols=5)
+    status_ws.clear()
+    status_ws.update("A1", [
+        ["Letztes Update", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+        ["Gefundene Zeilen", len(df)],
+        ["Bankroll pro Spot", BANKROLL],
+        ["Top N", TOP_N],
+        ["Min ROI", MIN_RAW_ROI],
+    ])
+
+    print("✅ Google Sheet erfolgreich aktualisiert.")
 
 
 if __name__ == "__main__":
-    scan()
-        
+    main()
