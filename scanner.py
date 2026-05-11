@@ -155,6 +155,7 @@ def get_or_create_worksheet(sheet, title, rows=1000, cols=20):
 
 
 def write_dataframe_to_sheet(ws, df):
+    format_google_sheet(opportunities_ws)
     ws.clear()
 
     if df.empty:
@@ -166,6 +167,54 @@ def write_dataframe_to_sheet(ws, df):
 
     ws.freeze(rows=1)
     ws.set_basic_filter()
+
+def format_google_sheet(ws):
+    ws.freeze(rows=1)
+    ws.set_basic_filter()
+
+    # Header dunkelblau + weiß + fett
+    ws.format("A1:K1", {
+        "backgroundColor": {"red": 0.12, "green": 0.31, "blue": 0.47},
+        "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "bold": True},
+        "horizontalAlignment": "CENTER",
+    })
+
+    # Ganze Tabelle etwas ordentlicher
+    ws.format("A:K", {
+        "verticalAlignment": "MIDDLE",
+        "wrapStrategy": "WRAP",
+    })
+
+    # Zahlenformate
+    ws.format("D:E", {"numberFormat": {"type": "NUMBER", "pattern": "0.0000"}})
+    ws.format("F:F", {"numberFormat": {"type": "NUMBER", "pattern": "0.00"}})
+    ws.format("G:I", {"numberFormat": {"type": "CURRENCY", "pattern": "$0.00"}})
+
+    # Spaltenbreiten
+    requests = [
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
+            "properties": {"pixelSize": 150},
+            "fields": "pixelSize"
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2},
+            "properties": {"pixelSize": 260},
+            "fields": "pixelSize"
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3},
+            "properties": {"pixelSize": 420},
+            "fields": "pixelSize"
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 10, "endIndex": 11},
+            "properties": {"pixelSize": 420},
+            "fields": "pixelSize"
+        }},
+    ]
+
+    ws.spreadsheet.batch_update({"requests": requests})
 
 
 # =====================
