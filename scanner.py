@@ -12,7 +12,9 @@ from google.oauth2.service_account import Credentials
 
 BANKROLL = 100
 TOP_N = 5
-MIN_RAW_ROI = 0.00  # 0.05 = nur Spots ab 5% ROI
+MIN_RAW_ROI = 0.00
+MIN_HISTORY_ROI = 5.0
+
 EVENT_LIMIT = 250
 MAX_PAGES = 4
 
@@ -21,42 +23,115 @@ EVENTS_URL = "https://gamma-api.polymarket.com/events"
 SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-KEYWORDS = [
-    "counter-strike",
-    "counter strike",
-    "cs2",
-    "pgl",
-    "pgl astana",
-    "pgl bucharest",
-    "pgl major",
-    "blast premier",
-    "iem cologne",
-    "iem katowice",
-    "esl pro league",
-    "fissure playground",
+CATEGORIES = {
+    "CS2": [
+        "counter-strike", "counter strike", "cs2", "pgl", "blast premier",
+        "iem", "esl pro league", "fissure"
+    ],
+    "LoL": [
+        "league of legends",
+        "world championship league of legends",
+        "mid-season invitational",
+        "msi league of legends",
+        "lck winner",
+        "lec winner",
+        "lpl winner"
+    ],
+    "Dota 2": [
+        "dota", "the international", "dreamleague", "riyadh masters"
+    ],
+    "Valorant": [
+        "valorant", "vct", "valorant champions", "masters valorant"
+    ],
+    "Fußball": [
+        "champions league winner",
+        "champions league champion",
+        "europa league winner",
+        "premier league winner",
+        "bundesliga winner",
+        "la liga winner",
+        "serie a winner",
+        "world cup winner",
+        "euro winner",
+    ],
+}
+
+EXCLUDE_KEYWORDS = [
+    " vs ",
+    "bo1",
+    "bo2",
+    "bo3",
+    "bo5",
+    "matchup",
+    "map ",
+    "group ",
+    "playoffs",
+    "qualifier",
+    "round ",
+]
+
+TOURNAMENT_WORDS = [
+    "winner",
+    "champion",
+    "who will win",
+    "to win",
+    "win the",
+    "championship",
+    "tournament",
+    "major",
+    "finals",
+    "world cup",
+    "worlds",
+    "league title",
 ]
 
 
 # =====================
-# Hilfsfunktionen
+# Helpers
 # =====================
 
 def parse_list(value):
     if isinstance(value, list):
         return value
-
     if isinstance(value, str):
         try:
             return json.loads(value)
         except Exception:
             return []
-
     return []
+
+
+def event_text(event):
+    return " ".join([
+        str(event.get("title", "")),
+        str(event.get("slug", "")),
+        str(event.get("description", "")),
+        str(event.get("seriesSlug", "")),
+        str(event.get("category", "")),
+    ]).lower()
+
+
+def get_event_category(event):
+    text = event_text(event)
+
+    if any(k in text for k in EXCLUDE_KEYWORDS):
+        return None
+
+    if " will " in text and " or " in text:
+        return None
+
+    if not any(k in text for k in TOURNAMENT_WORDS):
+        return None
+
+    for category, keywords in CATEGORIES.items():
+        if any(k in text for k in keywords):
+            return category
+
+    return None
 
 
 def get_events(limit=EVENT_LIMIT, max_pages=MAX_PAGES):
     events_by_id = {}
-
     orders = ["volume_24hr", "volume", "liquidity"]
 
     for order in orders:
@@ -74,7 +149,6 @@ def get_events(limit=EVENT_LIMIT, max_pages=MAX_PAGES):
 
             r = requests.get(EVENTS_URL, params=params, timeout=20)
             r.raise_for_status()
-
             batch = r.json()
 
             if not batch:
@@ -92,16 +166,30 @@ def get_events(limit=EVENT_LIMIT, max_pages=MAX_PAGES):
     return list(events_by_id.values())
 
 
-def is_cs_event(event):
-    text = " ".join([
-        str(event.get("title", "")),
-        str(event.get("slug", "")),
-        str(event.get("description", "")),
-        str(event.get("seriesSlug", "")),
-        str(event.get("category", "")),
-    ]).lower()
+def fetch_event_by_slug(slug):
+    for closed in ["false", "true"]:
+        params = {
+            "slug": slug,
+            "closed": closed,
+            "limit": 1,
+        }
 
-    return any(k in text for k in KEYWORDS)
+        try:
+            r = requests.get(EVENTS_URL, params=params, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+
+            if isinstance(data, list):
+                for e in data:
+                    if e.get("slug") == slug:
+                        return e
+            elif isinstance(data, dict) and data.get("slug") == slug:
+                return data
+
+        except Exception as e:
+            print(f"Fehler beim Laden von Event {slug}: {e}")
+
+    return None
 
 
 def get_yes_price(market):
@@ -115,7 +203,7 @@ def get_yes_price(market):
         if str(outcome).lower() == "yes":
             try:
                 price = float(price)
-                if price > 0:
+                if price >= 0:
                     return price
             except Exception:
                 return None
@@ -143,7 +231,7 @@ def connect_google_sheet():
     return client.open_by_key(SHEET_ID)
 
 
-def get_or_create_worksheet(sheet, title, rows=1000, cols=20):
+def get_or_create_worksheet(sheet, title, rows=1000, cols=25):
     try:
         return sheet.worksheet(title)
     except gspread.WorksheetNotFound:
@@ -161,11 +249,15 @@ def write_dataframe_to_sheet(ws, df):
     ws.update(values=values, range_name="A1")
 
 
+# =====================
+# Google Sheets Format
+# =====================
+
 def format_google_sheet(ws):
     ws.freeze(rows=1)
     ws.set_basic_filter()
 
-    ws.format("A1:K1", {
+    ws.format("A1:L1", {
         "backgroundColor": {"red": 0.12, "green": 0.31, "blue": 0.47},
         "textFormat": {
             "foregroundColor": {"red": 1, "green": 1, "blue": 1},
@@ -174,72 +266,49 @@ def format_google_sheet(ws):
         "horizontalAlignment": "CENTER",
     })
 
-    ws.format("A:K", {
+    ws.format("A:L", {
         "verticalAlignment": "MIDDLE",
         "wrapStrategy": "WRAP",
     })
 
-    ws.format("D:E", {
+    ws.format("E:F", {
         "numberFormat": {"type": "NUMBER", "pattern": "0.0000"}
     })
 
-    ws.format("F:F", {
+    ws.format("G:G", {
         "numberFormat": {"type": "NUMBER", "pattern": "0.00"}
     })
 
-    ws.format("G:I", {
+    ws.format("H:J", {
         "numberFormat": {"type": "CURRENCY", "pattern": "$0.00"}
     })
 
     requests = [
-        {
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws.id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 0,
-                    "endIndex": 1,
-                },
-                "properties": {"pixelSize": 150},
-                "fields": "pixelSize",
-            }
-        },
-        {
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws.id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 1,
-                    "endIndex": 2,
-                },
-                "properties": {"pixelSize": 260},
-                "fields": "pixelSize",
-            }
-        },
-        {
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws.id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 2,
-                    "endIndex": 3,
-                },
-                "properties": {"pixelSize": 420},
-                "fields": "pixelSize",
-            }
-        },
-        {
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws.id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 10,
-                    "endIndex": 11,
-                },
-                "properties": {"pixelSize": 420},
-                "fields": "pixelSize",
-            }
-        },
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
+            "properties": {"pixelSize": 150},
+            "fields": "pixelSize"
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2},
+            "properties": {"pixelSize": 120},
+            "fields": "pixelSize"
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3},
+            "properties": {"pixelSize": 260},
+            "fields": "pixelSize"
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 3, "endIndex": 4},
+            "properties": {"pixelSize": 420},
+            "fields": "pixelSize"
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 11, "endIndex": 12},
+            "properties": {"pixelSize": 420},
+            "fields": "pixelSize"
+        }},
     ]
 
     ws.spreadsheet.batch_update({"requests": requests})
@@ -265,7 +334,7 @@ def color_events_and_roi(ws, df):
         if event not in event_map:
             event_map[event] = event_colors[len(event_map) % len(event_colors)]
 
-        row_index = i + 1  # Header ist Zeile 0
+        row_index = i + 1
 
         requests.append({
             "repeatCell": {
@@ -274,7 +343,7 @@ def color_events_and_roi(ws, df):
                     "startRowIndex": row_index,
                     "endRowIndex": row_index + 1,
                     "startColumnIndex": 0,
-                    "endColumnIndex": 11,
+                    "endColumnIndex": 12,
                 },
                 "cell": {
                     "userEnteredFormat": {
@@ -285,7 +354,6 @@ def color_events_and_roi(ws, df):
             }
         })
 
-    # ROI > 10% grün markieren, Spalte F
     requests.append({
         "addConditionalFormatRule": {
             "rule": {
@@ -293,8 +361,8 @@ def color_events_and_roi(ws, df):
                     "sheetId": ws.id,
                     "startRowIndex": 1,
                     "endRowIndex": len(df) + 1,
-                    "startColumnIndex": 5,
-                    "endColumnIndex": 6,
+                    "startColumnIndex": 6,
+                    "endColumnIndex": 7,
                 }],
                 "booleanRule": {
                     "condition": {
@@ -302,11 +370,7 @@ def color_events_and_roi(ws, df):
                         "values": [{"userEnteredValue": "10"}],
                     },
                     "format": {
-                        "backgroundColor": {
-                            "red": 0.72,
-                            "green": 0.88,
-                            "blue": 0.70,
-                        },
+                        "backgroundColor": {"red": 0.72, "green": 0.88, "blue": 0.70},
                         "textFormat": {"bold": True},
                     },
                 },
@@ -328,14 +392,17 @@ def build_opportunities():
     events = get_events()
     print(f"Events geladen: {len(events)}")
 
-    cs_events = [e for e in events if is_cs_event(e)]
-    print(f"CS Events gefunden: {len(cs_events)}")
+    target_events = []
 
-    print("\nGefundene CS Events:")
-    for e in cs_events:
-        print("-", e.get("title"), "|", e.get("slug"))
+    for e in events:
+        category = get_event_category(e)
+        if category:
+            e["_scanner_category"] = category
+            target_events.append(e)
 
-    for event in cs_events:
+    print(f"Turnier-Events gefunden: {len(target_events)}")
+
+    for event in target_events:
         markets = event.get("markets", [])
         team_prices = []
 
@@ -382,7 +449,9 @@ def build_opportunities():
 
             rows.append({
                 "Zeit": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "Kategorie": event.get("_scanner_category"),
                 "Event": event.get("title"),
+                "Event Slug": event.get("slug"),
                 "Team / Markt": t["team"],
                 "YES Preis": round(price, 4),
                 f"Summe Top {TOP_N}": round(yes_sum, 4),
@@ -390,7 +459,6 @@ def build_opportunities():
                 "Stake $": round(stake, 2),
                 "Payout $": round(payout, 2),
                 "Profit $": round(profit, 2),
-                "Volumen Event": event.get("volume"),
                 "Link": "https://polymarket.com/event/" + str(event.get("slug", "")),
             })
 
@@ -402,8 +470,221 @@ def build_opportunities():
     return df
 
 
+# =====================
+# History
+# =====================
+
+def update_history_summary(sheet, df):
+    if df.empty:
+        return
+
+    ws = get_or_create_worksheet(sheet, "History Summary", rows=1000, cols=25)
+
+    try:
+        existing = pd.DataFrame(ws.get_all_records())
+    except Exception:
+        existing = pd.DataFrame()
+
+    snapshot_rows = []
+
+    grouped = df.groupby(["Kategorie", "Event", "Event Slug"], dropna=False)
+
+    for (category, event, slug), group in grouped:
+        roi = float(group["ROI %"].iloc[0])
+
+        if roi < MIN_HISTORY_ROI:
+            continue
+
+        top_sum = float(group[f"Summe Top {TOP_N}"].iloc[0])
+        profit = float(group["Profit $"].iloc[0])
+        link = group["Link"].iloc[0]
+        timestamp = group["Zeit"].iloc[0]
+
+        teams = " | ".join(
+            f"{row['Team / Markt']} @ {row['YES Preis']}"
+            for _, row in group.iterrows()
+        )
+
+        snapshot_rows.append({
+            "Snapshot": "Current",
+            "Kategorie": category,
+            "Event": event,
+            "Event Slug": slug,
+            "Zeit": timestamp,
+            "ROI %": roi,
+            f"Summe Top {TOP_N}": top_sum,
+            "Profit $": profit,
+            "Teams": teams,
+            "Top 5 gewonnen?": "",
+            "Gewinner": "",
+            "Link": link,
+        })
+
+    current = pd.DataFrame(snapshot_rows)
+
+    if current.empty and existing.empty:
+        ws.clear()
+        ws.update(values=[["Keine History-Spots mit ROI > 5% gefunden."]], range_name="A1")
+        return
+
+    if existing.empty or "Event Slug" not in existing.columns:
+        combined = current
+    else:
+        combined = pd.concat([existing, current], ignore_index=True)
+
+    combined = combined.drop_duplicates(
+        subset=["Event Slug", "Zeit"],
+        keep="last"
+    )
+
+    result_rows = []
+
+    for slug, group in combined.groupby("Event Slug"):
+        group = group[group["ROI %"].astype(float) >= MIN_HISTORY_ROI]
+
+        if group.empty:
+            continue
+
+        group = group.sort_values("ROI %")
+
+        lowest = group.iloc[0]
+        highest = group.iloc[-1]
+        middle = group.iloc[len(group) // 2]
+
+        for label, row in [
+            ("Lowest ROI > 5%", lowest),
+            ("Middle ROI", middle),
+            ("Highest ROI", highest),
+        ]:
+            result_rows.append({
+                "Snapshot": label,
+                "Kategorie": row["Kategorie"],
+                "Event": row["Event"],
+                "Event Slug": row["Event Slug"],
+                "Zeit": row["Zeit"],
+                "ROI %": row["ROI %"],
+                f"Summe Top {TOP_N}": row[f"Summe Top {TOP_N}"],
+                "Profit $": row["Profit $"],
+                "Teams": row["Teams"],
+                "Top 5 gewonnen?": row.get("Top 5 gewonnen?", ""),
+                "Gewinner": row.get("Gewinner", ""),
+                "Link": row["Link"],
+            })
+
+    result = pd.DataFrame(result_rows)
+
+    if result.empty:
+        ws.clear()
+        ws.update(values=[["Keine History-Spots mit ROI > 5% gefunden."]], range_name="A1")
+        return
+
+    result = result.sort_values(["Event", "Snapshot"])
+
+    ws.clear()
+    ws.update(
+        values=[result.columns.tolist()] + result.astype(str).values.tolist(),
+        range_name="A1"
+    )
+
+    ws.freeze(rows=1)
+    ws.set_basic_filter()
+
+
+def parse_team_names_from_history(teams_text):
+    teams = []
+
+    for part in str(teams_text).split("|"):
+        name = part.split("@")[0].strip()
+        if name:
+            teams.append(name.lower())
+
+    return teams
+
+
+def detect_resolved_winner(event):
+    if not event:
+        return None
+
+    markets = event.get("markets", [])
+
+    for market in markets:
+        yes_price = get_yes_price(market)
+
+        if yes_price is None:
+            continue
+
+        if yes_price >= 0.98:
+            return (
+                market.get("question")
+                or market.get("title")
+                or market.get("slug")
+            )
+
+    return None
+
+
+def resolve_history_results(sheet):
+    ws = get_or_create_worksheet(sheet, "History Summary", rows=1000, cols=25)
+
+    try:
+        df = pd.DataFrame(ws.get_all_records())
+    except Exception:
+        return
+
+    if df.empty or "Event Slug" not in df.columns:
+        return
+
+    changed = False
+    event_cache = {}
+
+    for idx, row in df.iterrows():
+        current_status = str(row.get("Top 5 gewonnen?", "")).strip()
+
+        if current_status:
+            continue
+
+        slug = row.get("Event Slug")
+
+        if not slug:
+            continue
+
+        if slug not in event_cache:
+            event_cache[slug] = fetch_event_by_slug(slug)
+
+        event = event_cache[slug]
+        winner = detect_resolved_winner(event)
+
+        if not winner:
+            continue
+
+        top_teams = parse_team_names_from_history(row.get("Teams", ""))
+        winner_lower = winner.lower()
+
+        top5_won = any(team in winner_lower or winner_lower in team for team in top_teams)
+
+        df.at[idx, "Gewinner"] = winner
+        df.at[idx, "Top 5 gewonnen?"] = "JA" if top5_won else "NEIN"
+        changed = True
+
+    if changed:
+        ws.clear()
+        ws.update(
+            values=[df.columns.tolist()] + df.astype(str).values.tolist(),
+            range_name="A1"
+        )
+        ws.freeze(rows=1)
+        ws.set_basic_filter()
+        print("✅ History Results aktualisiert.")
+    else:
+        print("Keine neuen resolved History-Ergebnisse gefunden.")
+
+
+# =====================
+# Main
+# =====================
+
 def main():
-    print("Starte Polymarket CS Scanner...")
+    print("Starte Polymarket Scanner...")
 
     df = build_opportunities()
     print("Gefundene Zeilen:", len(df))
@@ -416,6 +697,9 @@ def main():
     format_google_sheet(opportunities_ws)
     color_events_and_roi(opportunities_ws, df)
 
+    update_history_summary(sheet, df)
+    resolve_history_results(sheet)
+
     status_ws = get_or_create_worksheet(sheet, "Status", rows=20, cols=5)
     status_ws.clear()
     status_ws.update(values=[
@@ -424,6 +708,7 @@ def main():
         ["Bankroll pro Spot", BANKROLL],
         ["Top N", TOP_N],
         ["Min ROI", MIN_RAW_ROI],
+        ["Min History ROI %", MIN_HISTORY_ROI],
     ], range_name="A1")
 
     print("✅ Google Sheet erfolgreich aktualisiert.")
