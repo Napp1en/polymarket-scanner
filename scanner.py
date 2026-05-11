@@ -153,9 +153,9 @@ def get_or_create_worksheet(sheet, title, rows=1000, cols=20):
     except gspread.WorksheetNotFound:
         return sheet.add_worksheet(title=title, rows=rows, cols=cols)
 
+format_google_sheet(opportunities_ws)
 
 def write_dataframe_to_sheet(ws, df):
-    format_google_sheet(opportunities_ws)
     ws.clear()
 
     if df.empty:
