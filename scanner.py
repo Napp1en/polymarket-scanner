@@ -12,7 +12,7 @@ from google.oauth2.service_account import Credentials
 
 BANKROLL = 100
 TOP_N = 5
-MIN_RAW_ROI = 0.00  # 0.05 = nur ab 5% ROI
+MIN_RAW_ROI = 0.00  # 0.05 = nur Spots ab 5% ROI
 EVENT_LIMIT = 250
 MAX_PAGES = 4
 
@@ -57,11 +57,7 @@ def parse_list(value):
 def get_events(limit=EVENT_LIMIT, max_pages=MAX_PAGES):
     events_by_id = {}
 
-    orders = [
-        "volume_24hr",
-        "volume",
-        "liquidity",
-    ]
+    orders = ["volume_24hr", "volume", "liquidity"]
 
     for order in orders:
         print(f"Lade Events nach: {order}")
@@ -153,65 +149,171 @@ def get_or_create_worksheet(sheet, title, rows=1000, cols=20):
     except gspread.WorksheetNotFound:
         return sheet.add_worksheet(title=title, rows=rows, cols=cols)
 
+
 def write_dataframe_to_sheet(ws, df):
-    format_google_sheet(ws)
     ws.clear()
 
     if df.empty:
-        ws.update("A1", [["Keine passenden Spots gefunden."]])
+        ws.update(values=[["Keine passenden Spots gefunden."]], range_name="A1")
         return
 
     values = [df.columns.tolist()] + df.astype(str).values.tolist()
-    ws.update("A1", values)
+    ws.update(values=values, range_name="A1")
 
-    ws.freeze(rows=1)
-    ws.set_basic_filter()
 
 def format_google_sheet(ws):
     ws.freeze(rows=1)
     ws.set_basic_filter()
 
-    # Header dunkelblau + weiß + fett
     ws.format("A1:K1", {
         "backgroundColor": {"red": 0.12, "green": 0.31, "blue": 0.47},
-        "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "bold": True},
+        "textFormat": {
+            "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+            "bold": True,
+        },
         "horizontalAlignment": "CENTER",
     })
 
-    # Ganze Tabelle etwas ordentlicher
     ws.format("A:K", {
         "verticalAlignment": "MIDDLE",
         "wrapStrategy": "WRAP",
     })
 
-    # Zahlenformate
-    ws.format("D:E", {"numberFormat": {"type": "NUMBER", "pattern": "0.0000"}})
-    ws.format("F:F", {"numberFormat": {"type": "NUMBER", "pattern": "0.00"}})
-    ws.format("G:I", {"numberFormat": {"type": "CURRENCY", "pattern": "$0.00"}})
+    ws.format("D:E", {
+        "numberFormat": {"type": "NUMBER", "pattern": "0.0000"}
+    })
 
-    # Spaltenbreiten
+    ws.format("F:F", {
+        "numberFormat": {"type": "NUMBER", "pattern": "0.00"}
+    })
+
+    ws.format("G:I", {
+        "numberFormat": {"type": "CURRENCY", "pattern": "$0.00"}
+    })
+
     requests = [
-        {"updateDimensionProperties": {
-            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
-            "properties": {"pixelSize": 150},
-            "fields": "pixelSize"
-        }},
-        {"updateDimensionProperties": {
-            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2},
-            "properties": {"pixelSize": 260},
-            "fields": "pixelSize"
-        }},
-        {"updateDimensionProperties": {
-            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3},
-            "properties": {"pixelSize": 420},
-            "fields": "pixelSize"
-        }},
-        {"updateDimensionProperties": {
-            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 10, "endIndex": 11},
-            "properties": {"pixelSize": 420},
-            "fields": "pixelSize"
-        }},
+        {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": ws.id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 0,
+                    "endIndex": 1,
+                },
+                "properties": {"pixelSize": 150},
+                "fields": "pixelSize",
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": ws.id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 1,
+                    "endIndex": 2,
+                },
+                "properties": {"pixelSize": 260},
+                "fields": "pixelSize",
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": ws.id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 2,
+                    "endIndex": 3,
+                },
+                "properties": {"pixelSize": 420},
+                "fields": "pixelSize",
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": ws.id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 10,
+                    "endIndex": 11,
+                },
+                "properties": {"pixelSize": 420},
+                "fields": "pixelSize",
+            }
+        },
     ]
+
+    ws.spreadsheet.batch_update({"requests": requests})
+
+
+def color_events_and_roi(ws, df):
+    if df.empty:
+        return
+
+    requests = []
+
+    event_colors = [
+        {"red": 1.00, "green": 0.95, "blue": 0.80},
+        {"red": 0.86, "green": 0.92, "blue": 0.98},
+        {"red": 0.89, "green": 0.95, "blue": 0.86},
+        {"red": 0.99, "green": 0.89, "blue": 0.82},
+        {"red": 0.91, "green": 0.88, "blue": 0.95},
+    ]
+
+    event_map = {}
+
+    for i, event in enumerate(df["Event"].tolist()):
+        if event not in event_map:
+            event_map[event] = event_colors[len(event_map) % len(event_colors)]
+
+        row_index = i + 1  # Header ist Zeile 0
+
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": row_index,
+                    "endRowIndex": row_index + 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 11,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": event_map[event]
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor",
+            }
+        })
+
+    # ROI > 10% grün markieren, Spalte F
+    requests.append({
+        "addConditionalFormatRule": {
+            "rule": {
+                "ranges": [{
+                    "sheetId": ws.id,
+                    "startRowIndex": 1,
+                    "endRowIndex": len(df) + 1,
+                    "startColumnIndex": 5,
+                    "endColumnIndex": 6,
+                }],
+                "booleanRule": {
+                    "condition": {
+                        "type": "NUMBER_GREATER",
+                        "values": [{"userEnteredValue": "10"}],
+                    },
+                    "format": {
+                        "backgroundColor": {
+                            "red": 0.72,
+                            "green": 0.88,
+                            "blue": 0.70,
+                        },
+                        "textFormat": {"bold": True},
+                    },
+                },
+            },
+            "index": 0,
+        }
+    })
 
     ws.spreadsheet.batch_update({"requests": requests})
 
@@ -304,21 +406,25 @@ def main():
     print("Starte Polymarket CS Scanner...")
 
     df = build_opportunities()
+    print("Gefundene Zeilen:", len(df))
 
     sheet = connect_google_sheet()
+    print("Google Sheet geöffnet:", sheet.title)
 
     opportunities_ws = get_or_create_worksheet(sheet, "Opportunities")
     write_dataframe_to_sheet(opportunities_ws, df)
+    format_google_sheet(opportunities_ws)
+    color_events_and_roi(opportunities_ws, df)
 
     status_ws = get_or_create_worksheet(sheet, "Status", rows=20, cols=5)
     status_ws.clear()
-    status_ws.update("A1", [
+    status_ws.update(values=[
         ["Letztes Update", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
         ["Gefundene Zeilen", len(df)],
         ["Bankroll pro Spot", BANKROLL],
         ["Top N", TOP_N],
         ["Min ROI", MIN_RAW_ROI],
-    ])
+    ], range_name="A1")
 
     print("✅ Google Sheet erfolgreich aktualisiert.")
 
