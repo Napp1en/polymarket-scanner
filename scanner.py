@@ -1041,8 +1041,6 @@ def main():
 
     # History / Outcome im Sheet
     update_history_summary(sheet, df)
-    update_outcome_history(sheet, df)
-    resolve_outcome(sheet)
 
     # Status
     status_ws = get_or_create_worksheet(sheet, "Status", rows=20, cols=5)
