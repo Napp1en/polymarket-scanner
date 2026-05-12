@@ -403,6 +403,51 @@ def format_history_summary(ws):
     ]
 
     ws.spreadsheet.batch_update({"requests": requests})
+    values = ws.get_all_values()
+
+    requests = []
+
+    for i, row in enumerate(values[1:], start=1):
+        try:
+            roi = float(row[5])  # ROI %
+            top_sum = float(row[6])  # Summe Top 5
+        except:
+            continue
+
+    # ROI Farben
+    if roi > 10:
+        color = {"red": 0.70, "green": 0.90, "blue": 0.70}
+    elif roi > 5:
+        color = {"red": 1.00, "green": 0.95, "blue": 0.70}
+    else:
+        color = None
+
+    # Strong Edge überschreibt
+    if top_sum < 0.90:
+        color = {"red": 0.65, "green": 0.85, "blue": 1.00}
+
+    if color:
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": i,
+                    "endRowIndex": i + 1,
+                    "startColumnIndex": 5,
+                    "endColumnIndex": 7,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": color,
+                        "textFormat": {"bold": True}
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat",
+            }
+        })
+
+    if requests:
+        ws.spreadsheet.batch_update({"requests": requests})
 
 # =====================
 # Scanner
