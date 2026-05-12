@@ -678,6 +678,8 @@ def update_stats_sheet_from_db(sheet):
         all_rows.append([title])
         all_rows.append(df.columns.tolist())
 
+        df = df.fillna("")
+
         for _, row in df.iterrows():
             all_rows.append(row.astype(str).tolist())
 
