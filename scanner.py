@@ -492,8 +492,8 @@ def format_history_summary(ws):
                     }],
                     "booleanRule": {
                         "condition": {
-                            "type": "NUMBER_LESS",
-                            "values": [{"userEnteredValue": "0.9"}],
+                            "type": "CUSTOM_FORMULA",
+                            "values": [{"userEnteredValue": "=G2<0.9"}],
                         },
                         "format": {
                             "backgroundColor": {"red": 0.65, "green": 0.85, "blue": 1.00},
