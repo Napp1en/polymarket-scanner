@@ -5,6 +5,10 @@ import pandas as pd
 import gspread
 from datetime import datetime
 from google.oauth2.service_account import Credentials
+import psycopg2
+from psycopg2.extras import execute_values
+
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # =====================
 # Einstellungen
@@ -465,6 +469,147 @@ def build_opportunities():
 # History
 # =====================
 
+def init_db():
+    if not DATABASE_URL:
+        print("DATABASE_URL fehlt – DB wird übersprungen.")
+        return
+
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS outcomes (
+            event_slug TEXT PRIMARY KEY,
+            event TEXT,
+            category TEXT,
+            best_roi FLOAT,
+            top_sum FLOAT,
+            teams TEXT,
+            winner TEXT,
+            top5_won BOOLEAN,
+            first_seen TIMESTAMP,
+            last_updated TIMESTAMP
+        )
+    """)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def save_outcome_to_db(df):
+    if df.empty or not DATABASE_URL:
+        return
+
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+
+    grouped = df.groupby(["Event", "Event Slug", "Kategorie"], dropna=False)
+    rows = []
+
+    for (event, slug, category), group in grouped:
+        roi = float(group["ROI %"].iloc[0])
+
+        if roi < MIN_HISTORY_ROI:
+            continue
+
+        top_sum = float(group[f"Summe Top {TOP_N}"].iloc[0])
+
+        teams = " | ".join(
+            f"{row['Team / Markt']} @ {row['YES Preis']}"
+            for _, row in group.iterrows()
+        )
+
+        rows.append((
+            slug,
+            event,
+            category,
+            roi,
+            top_sum,
+            teams,
+            None,
+            None,
+            datetime.now(),
+            datetime.now()
+        ))
+
+    if not rows:
+        cur.close()
+        conn.close()
+        return
+
+    execute_values(cur, """
+        INSERT INTO outcomes (
+            event_slug, event, category, best_roi, top_sum, teams,
+            winner, top5_won, first_seen, last_updated
+        ) VALUES %s
+        ON CONFLICT (event_slug) DO UPDATE SET
+            best_roi = CASE
+                WHEN EXCLUDED.best_roi > outcomes.best_roi
+                THEN EXCLUDED.best_roi
+                ELSE outcomes.best_roi
+            END,
+            top_sum = CASE
+                WHEN EXCLUDED.best_roi > outcomes.best_roi
+                THEN EXCLUDED.top_sum
+                ELSE outcomes.top_sum
+            END,
+            teams = CASE
+                WHEN EXCLUDED.best_roi > outcomes.best_roi
+                THEN EXCLUDED.teams
+                ELSE outcomes.teams
+            END,
+            last_updated = EXCLUDED.last_updated
+    """, rows)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def resolve_outcomes_db():
+    if not DATABASE_URL:
+        return
+
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT event_slug, teams FROM outcomes
+        WHERE winner IS NULL
+    """)
+
+    rows = cur.fetchall()
+
+    for slug, teams_text in rows:
+        event = fetch_event_by_slug(slug)
+        winner = detect_resolved_winner(event)
+
+        if not winner:
+            continue
+
+        teams = [t.split("@")[0].strip().lower() for t in teams_text.split("|")]
+        winner_lower = winner.lower()
+
+        top5_won = any(team in winner_lower or winner_lower in team for team in teams)
+
+        cur.execute("""
+            UPDATE outcomes
+            SET winner = %s,
+                top5_won = %s,
+                last_updated = %s
+            WHERE event_slug = %s
+        """, (
+            winner,
+            top5_won,
+            datetime.now(),
+            slug
+        ))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
 def update_history_summary(sheet, df):
     if df.empty:
         return
@@ -787,6 +932,12 @@ def main():
     df = build_opportunities()
     print("Gefundene Zeilen:", len(df))
 
+    # Datenbank
+    init_db()
+    save_outcome_to_db(df)
+    resolve_outcomes_db()
+
+    # Google Sheet
     sheet = connect_google_sheet()
     print("Google Sheet geöffnet:", sheet.title)
 
@@ -795,9 +946,12 @@ def main():
     format_google_sheet(opportunities_ws)
     color_events_and_roi(opportunities_ws, df)
 
+    # History / Outcome im Sheet
     update_history_summary(sheet, df)
-    resolve_history_results(sheet)
+    update_outcome_history(sheet, df)
+    resolve_outcome(sheet)
 
+    # Status
     status_ws = get_or_create_worksheet(sheet, "Status", rows=20, cols=5)
     status_ws.clear()
     status_ws.update(values=[
@@ -808,12 +962,8 @@ def main():
         ["Min ROI", MIN_RAW_ROI],
         ["Min History ROI %", MIN_HISTORY_ROI],
     ], range_name="A1")
-    update_history_summary(sheet, df)
-    update_outcome_history(sheet, df)
-    resolve_outcome(sheet)
 
     print("✅ Google Sheet erfolgreich aktualisiert.")
-
 
 if __name__ == "__main__":
     main()
