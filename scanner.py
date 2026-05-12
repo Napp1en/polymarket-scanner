@@ -610,6 +610,96 @@ def resolve_outcomes_db():
     cur.close()
     conn.close()
 
+def update_stats_sheet_from_db(sheet):
+    if not DATABASE_URL:
+        print("DATABASE_URL fehlt – Stats werden übersprungen.")
+        return
+
+    ws = get_or_create_worksheet(sheet, "Stats", rows=1000, cols=10)
+
+    conn = psycopg2.connect(DATABASE_URL)
+
+    queries = {
+        "Gesamt": """
+            SELECT
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE top5_won IS NOT NULL) AS resolved,
+                COUNT(*) FILTER (WHERE top5_won = true) AS wins,
+                COUNT(*) FILTER (WHERE top5_won = false) AS losses,
+                ROUND(AVG(best_roi)::numeric, 2) AS avg_roi
+            FROM outcomes;
+        """,
+        "Nach Kategorie": """
+            SELECT
+                category,
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE top5_won IS NOT NULL) AS resolved,
+                COUNT(*) FILTER (WHERE top5_won = true) AS wins,
+                COUNT(*) FILTER (WHERE top5_won = false) AS losses,
+                ROUND(
+                    100.0 * COUNT(*) FILTER (WHERE top5_won = true)
+                    / NULLIF(COUNT(*) FILTER (WHERE top5_won IS NOT NULL), 0),
+                    2
+                ) AS winrate_percent,
+                ROUND(AVG(best_roi)::numeric, 2) AS avg_roi
+            FROM outcomes
+            GROUP BY category
+            ORDER BY total DESC;
+        """,
+        "Nach ROI Bereich": """
+            SELECT
+                CASE
+                    WHEN best_roi < 8 THEN '5-8%'
+                    WHEN best_roi < 10 THEN '8-10%'
+                    WHEN best_roi < 15 THEN '10-15%'
+                    ELSE '15%+'
+                END AS roi_range,
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE top5_won IS NOT NULL) AS resolved,
+                COUNT(*) FILTER (WHERE top5_won = true) AS wins,
+                COUNT(*) FILTER (WHERE top5_won = false) AS losses,
+                ROUND(
+                    100.0 * COUNT(*) FILTER (WHERE top5_won = true)
+                    / NULLIF(COUNT(*) FILTER (WHERE top5_won IS NOT NULL), 0),
+                    2
+                ) AS winrate_percent,
+                ROUND(AVG(best_roi)::numeric, 2) AS avg_roi
+            FROM outcomes
+            GROUP BY roi_range
+            ORDER BY MIN(best_roi);
+        """
+    }
+
+    all_rows = []
+
+    for title, query in queries.items():
+        df = pd.read_sql_query(query, conn)
+
+        all_rows.append([title])
+        all_rows.append(df.columns.tolist())
+
+        for _, row in df.iterrows():
+            all_rows.append(row.astype(str).tolist())
+
+        all_rows.append([])
+
+    conn.close()
+
+    ws.clear()
+    ws.update(values=all_rows, range_name="A1")
+    ws.freeze(rows=1)
+    ws.set_basic_filter()
+
+    ws.format("A1:J1", {
+        "backgroundColor": {"red": 0.12, "green": 0.31, "blue": 0.47},
+        "textFormat": {
+            "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+            "bold": True,
+        },
+    })
+
+    print("✅ Stats Sheet aktualisiert.")
+
 def update_history_summary(sheet, df):
     if df.empty:
         return
@@ -940,6 +1030,7 @@ def main():
     # Google Sheet
     sheet = connect_google_sheet()
     print("Google Sheet geöffnet:", sheet.title)
+    update_stats_sheet_from_db(sheet)
 
     opportunities_ws = get_or_create_worksheet(sheet, "Opportunities")
     write_dataframe_to_sheet(opportunities_ws, df)
