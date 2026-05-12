@@ -376,6 +376,135 @@ def color_events_and_roi(ws, df):
 
     ws.spreadsheet.batch_update({"requests": requests})
 
+def format_history_summary(ws):
+    ws.freeze(rows=1)
+    ws.set_basic_filter()
+
+    max_rows = ws.row_count
+
+    # Header
+    ws.format("A1:L1", {
+        "backgroundColor": {"red": 0.10, "green": 0.30, "blue": 0.50},
+        "textFormat": {
+            "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+            "bold": True,
+        },
+        "horizontalAlignment": "CENTER",
+    })
+
+    # Allgemein
+    ws.format("A:L", {
+        "verticalAlignment": "MIDDLE",
+        "wrapStrategy": "WRAP",
+    })
+
+    # Spaltenbreiten
+    requests = [
+        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 140}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2}, "properties": {"pixelSize": 120}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3}, "properties": {"pixelSize": 280}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 3, "endIndex": 4}, "properties": {"pixelSize": 160}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 4, "endIndex": 5}, "properties": {"pixelSize": 150}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 8, "endIndex": 9}, "properties": {"pixelSize": 500}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 11, "endIndex": 12}, "properties": {"pixelSize": 420}, "fields": "pixelSize"}},
+    ]
+
+    # Event-Farben nach Spalte C = Event
+    event_colors = [
+        {"red": 1.00, "green": 0.95, "blue": 0.80},
+        {"red": 0.86, "green": 0.92, "blue": 0.98},
+        {"red": 0.89, "green": 0.95, "blue": 0.86},
+        {"red": 0.99, "green": 0.89, "blue": 0.82},
+        {"red": 0.91, "green": 0.88, "blue": 0.95},
+    ]
+
+    values = ws.get_all_values()
+    event_map = {}
+
+    for i, row in enumerate(values[1:], start=1):
+        if len(row) < 3:
+            continue
+
+        event = row[2]
+
+        if event not in event_map:
+            event_map[event] = event_colors[len(event_map) % len(event_colors)]
+
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": i,
+                    "endRowIndex": i + 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 12,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": event_map[event]
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor",
+            }
+        })
+
+    ws.spreadsheet.batch_update({"requests": requests})
+
+    # ROI > 10 grün markieren, Spalte F = ROI %
+    ws.spreadsheet.batch_update({
+        "requests": [{
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": ws.id,
+                        "startRowIndex": 1,
+                        "endRowIndex": max_rows,
+                        "startColumnIndex": 5,
+                        "endColumnIndex": 6,
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "NUMBER_GREATER",
+                            "values": [{"userEnteredValue": "10"}],
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 0.70, "green": 0.90, "blue": 0.70},
+                            "textFormat": {"bold": True},
+                        },
+                    },
+                },
+                "index": 0,
+            }
+        }]
+    })
+
+    # Strong Edge: Summe Top 5 < 0.90, Spalte G
+    ws.spreadsheet.batch_update({
+        "requests": [{
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": ws.id,
+                        "startRowIndex": 1,
+                        "endRowIndex": max_rows,
+                        "startColumnIndex": 6,
+                        "endColumnIndex": 7,
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "NUMBER_LESS",
+                            "values": [{"userEnteredValue": "0.90"}],
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 0.65, "green": 0.85, "blue": 1.00},
+                            "textFormat": {"bold": True},
+                        },
+                    },
+                },
+                "index": 0,
+            }
+        }]
+    })
 
 # =====================
 # Scanner
@@ -813,6 +942,7 @@ def update_history_summary(sheet, df):
         values=[result.columns.tolist()] + result.astype(str).values.tolist(),
         range_name="A1"
     )
+    format_history_summary(ws)
 
     ws.freeze(rows=1)
     ws.set_basic_filter()
