@@ -415,12 +415,12 @@ def format_history_summary(ws):
             continue
 
     # ROI Farben
-    if roi > 10:
-        color = {"red": 0.70, "green": 0.90, "blue": 0.70}
-    elif roi > 5:
-        color = {"red": 1.00, "green": 0.95, "blue": 0.70}
-    else:
-        color = None
+        if roi > 10:
+            color = {"red": 0.70, "green": 0.90, "blue": 0.70}
+        elif roi > 5:
+            color = {"red": 1.00, "green": 0.95, "blue": 0.70}
+        else:
+            color = None
 
     # Strong Edge überschreibt
     if top_sum < 0.90:
