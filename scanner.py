@@ -452,6 +452,8 @@ def build_opportunities():
 
     for event in target_events:
         markets = event.get("markets", [])
+        if len(markets) < TOP_N or len(markets) > 40:
+            continue
         team_prices = []
 
         for market in markets:
