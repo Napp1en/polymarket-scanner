@@ -3,10 +3,12 @@ import json
 import requests
 import pandas as pd
 import gspread
-import psycopg2
-from psycopg2.extras import execute_values
 from datetime import datetime
 from google.oauth2.service_account import Credentials
+import psycopg2
+from psycopg2.extras import execute_values
+
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # =====================
 # Einstellungen
@@ -14,18 +16,16 @@ from google.oauth2.service_account import Credentials
 
 BANKROLL = 100
 TOP_N = 5
-MIN_RAW_ROI = 0.05          # 0.05 = 5%
-MIN_HISTORY_ROI = 5.0      # 5.0 = 5%
+MIN_RAW_ROI = 0.05
+MIN_HISTORY_ROI = 5.0
 
 EVENT_LIMIT = 250
 MAX_PAGES = 4
 
 EVENTS_URL = "https://gamma-api.polymarket.com/events"
-BOOK_URL = "https://clob.polymarket.com/book"
 
 SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-DATABASE_URL = os.getenv("DATABASE_URL")
 
 CATEGORIES = {
     "CS2": [
@@ -48,39 +48,60 @@ CATEGORIES = {
         "valorant", "vct", "valorant champions", "masters valorant"
     ],
     "Fußball": [
-        "champions league",
-        "europa league",
-        "premier league",
-        "bundesliga",
-        "la liga",
-        "serie a",
-        "world cup",
-        "euro"
-    ],
-    "Basketball": [
-        "nba champion", "nba finals", "euroleague"
-    ],
-    "Tennis": [
-        "wimbledon", "french open", "us open", "australian open",
-        "atp finals", "wta finals"
+        "champions league winner",
+        "champions league champion",
+        "europa league winner",
+        "premier league winner",
+        "bundesliga winner",
+        "la liga winner",
+        "serie a winner",
+        "world cup winner",
+        "euro winner",
     ],
 }
 
+EXCLUDE_KEYWORDS = [
+    " vs ",
+    "bo1",
+    "bo2",
+    "bo3",
+    "bo5",
+    "matchup",
+    "map ",
+    "group ",
+    "playoffs",
+    "qualifier",
+    "round ",
+]
+
+TOURNAMENT_WORDS = [
+    "winner",
+    "champion",
+    "who will win",
+    "to win",
+    "win the",
+    "championship",
+    "tournament",
+    "major",
+    "finals",
+    "world cup",
+    "worlds",
+    "league title",
+]
+
 
 # =====================
-# Helper
+# Helpers
 # =====================
 
 def parse_list(value):
     if isinstance(value, list):
         return value
-
     if isinstance(value, str):
         try:
             return json.loads(value)
         except Exception:
             return []
-
     return []
 
 
@@ -106,7 +127,7 @@ def get_event_category(event):
 
 def get_events(limit=EVENT_LIMIT, max_pages=MAX_PAGES):
     events_by_id = {}
-    orders = ["volume_24hr"]
+    orders = ["volume_24hr", "volume", "liquidity"]
 
     for order in orders:
         print(f"Lade Events nach: {order}")
@@ -157,8 +178,7 @@ def fetch_event_by_slug(slug):
                 for e in data:
                     if e.get("slug") == slug:
                         return e
-
-            if isinstance(data, dict) and data.get("slug") == slug:
+            elif isinstance(data, dict) and data.get("slug") == slug:
                 return data
 
         except Exception as e:
@@ -167,129 +187,24 @@ def fetch_event_by_slug(slug):
     return None
 
 
-def get_yes_token_id(market):
+def get_yes_price(market):
     outcomes = parse_list(market.get("outcomes"))
-    token_ids = parse_list(market.get("clobTokenIds"))
+    prices = parse_list(market.get("outcomePrices"))
 
-    for outcome, token_id in zip(outcomes, token_ids):
-        if str(outcome).lower() == "yes":
-            return str(token_id)
-
-    return None
-
-
-def get_orderbook(token_id):
-    try:
-        r = requests.get(BOOK_URL, params={"token_id": token_id}, timeout=10)
-
-        if r.status_code != 200:
-            return []
-
-        data = r.json()
-        asks = data.get("asks", [])
-
-        clean_asks = []
-
-        for ask in asks:
-            try:
-                price = float(ask["price"])
-                size = float(ask["size"])
-
-                if price > 0 and size > 0:
-                    clean_asks.append({
-                        "price": price,
-                        "size": size,
-                    })
-
-            except Exception:
-                continue
-
-        clean_asks.sort(key=lambda x: x["price"])
-        return clean_asks
-
-    except Exception:
-        return []
-
-
-def best_ask(asks):
-    if not asks:
+    if not outcomes or not prices:
         return None
-    return asks[0]["price"]
 
-
-def total_depth(asks):
-    return sum(level["size"] for level in asks)
-
-
-def cost_to_buy_shares(asks, shares_needed):
-    remaining = shares_needed
-    cost = 0.0
-
-    for level in asks:
-        take = min(remaining, level["size"])
-        cost += take * level["price"]
-        remaining -= take
-
-        if remaining <= 1e-9:
-            return cost
+    for outcome, price in zip(outcomes, prices):
+        if str(outcome).lower() == "yes":
+            try:
+                price = float(price)
+                if price >= 0:
+                    return price
+            except Exception:
+                return None
 
     return None
 
-
-def find_equal_payout(selected, bankroll):
-    max_possible_q = min(total_depth(team["asks"]) for team in selected)
-
-    low = 0.0
-    high = max_possible_q
-
-    for _ in range(60):
-        mid = (low + high) / 2
-
-        total_cost = 0.0
-        possible = True
-
-        for team in selected:
-            cost = cost_to_buy_shares(team["asks"], mid)
-
-            if cost is None:
-                possible = False
-                break
-
-            total_cost += cost
-
-        if possible and total_cost <= bankroll:
-            low = mid
-        else:
-            high = mid
-
-    payout = low
-    rows = []
-    real_cost = 0.0
-
-    for team in selected:
-        cost = cost_to_buy_shares(team["asks"], payout)
-
-        if cost is None or payout <= 0:
-            continue
-
-        avg_price = cost / payout
-        real_cost += cost
-
-        rows.append({
-            "team": team["team"],
-            "best_ask": best_ask(team["asks"]),
-            "avg_price": avg_price,
-            "stake": cost,
-            "shares": payout,
-            "depth": total_depth(team["asks"]),
-        })
-
-    return payout, real_cost, rows
-
-
-# =====================
-# Google Sheets
-# =====================
 
 def connect_google_sheet():
     if not SHEET_ID:
@@ -311,7 +226,7 @@ def connect_google_sheet():
     return client.open_by_key(SHEET_ID)
 
 
-def get_or_create_worksheet(sheet, title, rows=1000, cols=30):
+def get_or_create_worksheet(sheet, title, rows=1000, cols=25):
     try:
         return sheet.worksheet(title)
     except gspread.WorksheetNotFound:
@@ -329,11 +244,15 @@ def write_dataframe_to_sheet(ws, df):
     ws.update(values=values, range_name="A1")
 
 
-def format_opportunities_sheet(ws):
+# =====================
+# Google Sheets Format
+# =====================
+
+def format_google_sheet(ws):
     ws.freeze(rows=1)
     ws.set_basic_filter()
 
-    ws.format("A1:P1", {
+    ws.format("A1:L1", {
         "backgroundColor": {"red": 0.12, "green": 0.31, "blue": 0.47},
         "textFormat": {
             "foregroundColor": {"red": 1, "green": 1, "blue": 1},
@@ -342,17 +261,49 @@ def format_opportunities_sheet(ws):
         "horizontalAlignment": "CENTER",
     })
 
-    ws.format("A:P", {
+    ws.format("A:L", {
         "verticalAlignment": "MIDDLE",
         "wrapStrategy": "WRAP",
     })
 
+    ws.format("E:F", {
+        "numberFormat": {"type": "NUMBER", "pattern": "0.0000"}
+    })
+
+    ws.format("G:G", {
+        "numberFormat": {"type": "NUMBER", "pattern": "0.00"}
+    })
+
+    ws.format("H:J", {
+        "numberFormat": {"type": "CURRENCY", "pattern": "$0.00"}
+    })
+
     requests = [
-        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 150}, "fields": "pixelSize"}},
-        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2}, "properties": {"pixelSize": 110}, "fields": "pixelSize"}},
-        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3}, "properties": {"pixelSize": 280}, "fields": "pixelSize"}},
-        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 4, "endIndex": 5}, "properties": {"pixelSize": 430}, "fields": "pixelSize"}},
-        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 15, "endIndex": 16}, "properties": {"pixelSize": 420}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
+            "properties": {"pixelSize": 150},
+            "fields": "pixelSize"
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2},
+            "properties": {"pixelSize": 120},
+            "fields": "pixelSize"
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3},
+            "properties": {"pixelSize": 260},
+            "fields": "pixelSize"
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 3, "endIndex": 4},
+            "properties": {"pixelSize": 420},
+            "fields": "pixelSize"
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 11, "endIndex": 12},
+            "properties": {"pixelSize": 420},
+            "fields": "pixelSize"
+        }},
     ]
 
     ws.spreadsheet.batch_update({"requests": requests})
@@ -387,7 +338,7 @@ def color_events_and_roi(ws, df):
                     "startRowIndex": row_index,
                     "endRowIndex": row_index + 1,
                     "startColumnIndex": 0,
-                    "endColumnIndex": 16,
+                    "endColumnIndex": 12,
                 },
                 "cell": {
                     "userEnteredFormat": {
@@ -398,8 +349,32 @@ def color_events_and_roi(ws, df):
             }
         })
 
-    ws.spreadsheet.batch_update({"requests": requests})
+    requests.append({
+        "addConditionalFormatRule": {
+            "rule": {
+                "ranges": [{
+                    "sheetId": ws.id,
+                    "startRowIndex": 1,
+                    "endRowIndex": len(df) + 1,
+                    "startColumnIndex": 6,
+                    "endColumnIndex": 7,
+                }],
+                "booleanRule": {
+                    "condition": {
+                        "type": "NUMBER_GREATER",
+                        "values": [{"userEnteredValue": "10"}],
+                    },
+                    "format": {
+                        "backgroundColor": {"red": 0.72, "green": 0.88, "blue": 0.70},
+                        "textFormat": {"bold": True},
+                    },
+                },
+            },
+            "index": 0,
+        }
+    })
 
+    ws.spreadsheet.batch_update({"requests": requests})
 
 def format_history_summary(ws):
     ws.freeze(rows=1)
@@ -420,15 +395,59 @@ def format_history_summary(ws):
     })
 
     requests = [
-        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 160}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 140}, "fields": "pixelSize"}},
         {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2}, "properties": {"pixelSize": 120}, "fields": "pixelSize"}},
-        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3}, "properties": {"pixelSize": 300}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3}, "properties": {"pixelSize": 280}, "fields": "pixelSize"}},
         {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 8, "endIndex": 9}, "properties": {"pixelSize": 500}, "fields": "pixelSize"}},
         {"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 11, "endIndex": 12}, "properties": {"pixelSize": 420}, "fields": "pixelSize"}},
     ]
 
     ws.spreadsheet.batch_update({"requests": requests})
+    values = ws.get_all_values()
 
+    requests = []
+
+    for i, row in enumerate(values[1:], start=1):
+        try:
+            roi = float(row[5])  # ROI %
+            top_sum = float(row[6])  # Summe Top 5
+        except:
+            continue
+
+    # ROI Farben
+    if roi > 10:
+        color = {"red": 0.70, "green": 0.90, "blue": 0.70}
+    elif roi > 5:
+        color = {"red": 1.00, "green": 0.95, "blue": 0.70}
+    else:
+        color = None
+
+    # Strong Edge überschreibt
+    if top_sum < 0.90:
+        color = {"red": 0.65, "green": 0.85, "blue": 1.00}
+
+    if color:
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": i,
+                    "endRowIndex": i + 1,
+                    "startColumnIndex": 5,
+                    "endColumnIndex": 7,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": color,
+                        "textFormat": {"bold": True}
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat",
+            }
+        })
+
+    if requests:
+        ws.spreadsheet.batch_update({"requests": requests})
 
 # =====================
 # Scanner
@@ -448,23 +467,16 @@ def build_opportunities():
             e["_scanner_category"] = category
             target_events.append(e)
 
-    print(f"Ziel-Events gefunden: {len(target_events)}")
+    print(f"Turnier-Events gefunden: {len(target_events)}")
 
     for event in target_events:
         markets = event.get("markets", [])
-        if len(markets) < TOP_N or len(markets) > 40:
-            continue
         team_prices = []
 
         for market in markets:
-            token_id = get_yes_token_id(market)
+            yes_price = get_yes_price(market)
 
-            if not token_id:
-                continue
-
-            asks = get_orderbook(token_id)
-
-            if not asks:
+            if yes_price is None:
                 continue
 
             team_name = (
@@ -475,180 +487,58 @@ def build_opportunities():
 
             team_prices.append({
                 "team": team_name,
-                "asks": asks,
-                "best_ask": best_ask(asks),
+                "price": yes_price,
                 "market": market,
             })
 
         if len(team_prices) < TOP_N:
             continue
 
-        team_prices.sort(key=lambda x: x["best_ask"], reverse=True)
+        team_prices.sort(key=lambda x: x["price"], reverse=True)
         top_teams = team_prices[:TOP_N]
 
-        payout, real_cost, execution_rows = find_equal_payout(top_teams, BANKROLL)
+        yes_sum = sum(t["price"] for t in top_teams)
 
-        if payout <= 0 or real_cost <= 0:
+        if yes_sum <= 0:
             continue
 
-        profit = payout - real_cost
-        roi = profit / real_cost
-        effective_sum = real_cost / payout
+        roi = (1 / yes_sum) - 1
 
         if roi < MIN_RAW_ROI:
             continue
 
-        for row in execution_rows:
+        payout = BANKROLL / yes_sum
+        profit = payout - BANKROLL
+
+        for t in top_teams:
+            price = t["price"]
+            stake = (price / yes_sum) * BANKROLL
+
             rows.append({
                 "Zeit": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "Kategorie": event.get("_scanner_category"),
                 "Event": event.get("title"),
                 "Event Slug": event.get("slug"),
-                "Team / Markt": row["team"],
-                "Best Ask": round(row["best_ask"], 4),
-                "Avg Buy Price": round(row["avg_price"], 4),
-                "Shares": round(row["shares"], 2),
-                "Stake $": round(row["stake"], 2),
-                "Real Cost $": round(real_cost, 2),
-                "Real Payout $": round(payout, 2),
-                "Real Profit $": round(profit, 2),
-                "Real ROI %": round(roi * 100, 2),
-                f"Effektive Summe Top {TOP_N}": round(effective_sum, 4),
-                "Depth Shares": round(row["depth"], 2),
+                "Team / Markt": t["team"],
+                "YES Preis": round(price, 4),
+                f"Summe Top {TOP_N}": round(yes_sum, 4),
+                "ROI %": round(roi * 100, 2),
+                "Stake $": round(stake, 2),
+                "Payout $": round(payout, 2),
+                "Profit $": round(profit, 2),
                 "Link": "https://polymarket.com/event/" + str(event.get("slug", "")),
             })
 
     df = pd.DataFrame(rows)
 
     if not df.empty:
-        df = df.sort_values(by=["Real ROI %", "Event"], ascending=[False, True])
+        df = df.sort_values(by=["ROI %", "Event"], ascending=[False, True])
 
     return df
 
 
 # =====================
-# History Summary
-# =====================
-
-def update_history_summary(sheet, df):
-    if df.empty:
-        return
-
-    ws = get_or_create_worksheet(sheet, "History Summary", rows=1000, cols=25)
-
-    try:
-        existing = pd.DataFrame(ws.get_all_records())
-    except Exception:
-        existing = pd.DataFrame()
-
-    snapshot_rows = []
-
-    grouped = df.groupby(["Kategorie", "Event", "Event Slug"], dropna=False)
-
-    for (category, event, slug), group in grouped:
-        roi = float(group["Real ROI %"].iloc[0])
-
-        if roi < MIN_HISTORY_ROI:
-            continue
-
-        top_sum = float(group[f"Effektive Summe Top {TOP_N}"].iloc[0])
-        profit = float(group["Real Profit $"].iloc[0])
-        payout = float(group["Real Payout $"].iloc[0])
-        cost = float(group["Real Cost $"].iloc[0])
-        link = group["Link"].iloc[0]
-        timestamp = group["Zeit"].iloc[0]
-
-        teams = " | ".join(
-            f"{row['Team / Markt']} @ avg {row['Avg Buy Price']}"
-            for _, row in group.iterrows()
-        )
-
-        snapshot_rows.append({
-            "Snapshot": "Current",
-            "Kategorie": category,
-            "Event": event,
-            "Event Slug": slug,
-            "Zeit": timestamp,
-            "Real ROI %": roi,
-            f"Effektive Summe Top {TOP_N}": top_sum,
-            "Real Profit $": profit,
-            "Real Payout $": payout,
-            "Real Cost $": cost,
-            "Teams": teams,
-            "Link": link,
-        })
-
-    current = pd.DataFrame(snapshot_rows)
-
-    if current.empty and existing.empty:
-        ws.clear()
-        ws.update(values=[["Keine History-Spots mit ROI > 5% gefunden."]], range_name="A1")
-        return
-
-    if existing.empty or "Event Slug" not in existing.columns:
-        combined = current
-    else:
-        combined = pd.concat([existing, current], ignore_index=True)
-
-    combined = combined.drop_duplicates(
-        subset=["Event Slug", "Zeit"],
-        keep="last"
-    )
-
-    result_rows = []
-
-    for slug, group in combined.groupby("Event Slug"):
-        group = group[group["Real ROI %"].astype(float) >= MIN_HISTORY_ROI]
-
-        if group.empty:
-            continue
-
-        group = group.sort_values("Real ROI %")
-
-        lowest = group.iloc[0]
-        highest = group.iloc[-1]
-        middle = group.iloc[len(group) // 2]
-
-        for label, row in [
-            ("Lowest ROI > 5%", lowest),
-            ("Middle ROI", middle),
-            ("Highest ROI", highest),
-        ]:
-            result_rows.append({
-                "Snapshot": label,
-                "Kategorie": row["Kategorie"],
-                "Event": row["Event"],
-                "Event Slug": row["Event Slug"],
-                "Zeit": row["Zeit"],
-                "Real ROI %": row["Real ROI %"],
-                f"Effektive Summe Top {TOP_N}": row[f"Effektive Summe Top {TOP_N}"],
-                "Real Profit $": row["Real Profit $"],
-                "Real Payout $": row["Real Payout $"],
-                "Real Cost $": row["Real Cost $"],
-                "Teams": row["Teams"],
-                "Link": row["Link"],
-            })
-
-    result = pd.DataFrame(result_rows)
-
-    if result.empty:
-        ws.clear()
-        ws.update(values=[["Keine History-Spots mit ROI > 5% gefunden."]], range_name="A1")
-        return
-
-    result = result.sort_values(["Event", "Snapshot"])
-
-    ws.clear()
-    ws.update(
-        values=[result.columns.tolist()] + result.astype(str).values.tolist(),
-        range_name="A1"
-    )
-
-    format_history_summary(ws)
-
-
-# =====================
-# DB
+# History
 # =====================
 
 def init_db():
@@ -666,9 +556,6 @@ def init_db():
             category TEXT,
             best_roi FLOAT,
             top_sum FLOAT,
-            real_payout FLOAT,
-            real_cost FLOAT,
-            real_profit FLOAT,
             teams TEXT,
             winner TEXT,
             top5_won BOOLEAN,
@@ -693,18 +580,15 @@ def save_outcome_to_db(df):
     rows = []
 
     for (event, slug, category), group in grouped:
-        roi = float(group["Real ROI %"].iloc[0])
+        roi = float(group["ROI %"].iloc[0])
 
         if roi < MIN_HISTORY_ROI:
             continue
 
-        top_sum = float(group[f"Effektive Summe Top {TOP_N}"].iloc[0])
-        payout = float(group["Real Payout $"].iloc[0])
-        real_cost = float(group["Real Cost $"].iloc[0])
-        profit = float(group["Real Profit $"].iloc[0])
+        top_sum = float(group[f"Summe Top {TOP_N}"].iloc[0])
 
         teams = " | ".join(
-            f"{row['Team / Markt']} @ avg {row['Avg Buy Price']}"
+            f"{row['Team / Markt']} @ {row['YES Preis']}"
             for _, row in group.iterrows()
         )
 
@@ -714,9 +598,6 @@ def save_outcome_to_db(df):
             category,
             roi,
             top_sum,
-            payout,
-            real_cost,
-            profit,
             teams,
             None,
             None,
@@ -731,9 +612,8 @@ def save_outcome_to_db(df):
 
     execute_values(cur, """
         INSERT INTO outcomes (
-            event_slug, event, category, best_roi, top_sum,
-            real_payout, real_cost, real_profit,
-            teams, winner, top5_won, first_seen, last_updated
+            event_slug, event, category, best_roi, top_sum, teams,
+            winner, top5_won, first_seen, last_updated
         ) VALUES %s
         ON CONFLICT (event_slug) DO UPDATE SET
             best_roi = CASE
@@ -746,21 +626,6 @@ def save_outcome_to_db(df):
                 THEN EXCLUDED.top_sum
                 ELSE outcomes.top_sum
             END,
-            real_payout = CASE
-                WHEN EXCLUDED.best_roi > outcomes.best_roi
-                THEN EXCLUDED.real_payout
-                ELSE outcomes.real_payout
-            END,
-            real_cost = CASE
-                WHEN EXCLUDED.best_roi > outcomes.best_roi
-                THEN EXCLUDED.real_cost
-                ELSE outcomes.real_cost
-            END,
-            real_profit = CASE
-                WHEN EXCLUDED.best_roi > outcomes.best_roi
-                THEN EXCLUDED.real_profit
-                ELSE outcomes.real_profit
-            END,
             teams = CASE
                 WHEN EXCLUDED.best_roi > outcomes.best_roi
                 THEN EXCLUDED.teams
@@ -772,46 +637,6 @@ def save_outcome_to_db(df):
     conn.commit()
     cur.close()
     conn.close()
-
-
-def parse_team_names_from_history(teams_text):
-    teams = []
-
-    for part in str(teams_text).split("|"):
-        name = part.split("@")[0].strip()
-        if name:
-            teams.append(name.lower())
-
-    return teams
-
-
-def detect_resolved_winner(event):
-    if not event:
-        return None
-
-    markets = event.get("markets", [])
-
-    for market in markets:
-        outcomes = parse_list(market.get("outcomes"))
-        prices = parse_list(market.get("outcomePrices"))
-
-        if not outcomes or not prices:
-            continue
-
-        for outcome, price in zip(outcomes, prices):
-            try:
-                price = float(price)
-            except Exception:
-                continue
-
-            if str(outcome).lower() == "yes" and price >= 0.98:
-                return (
-                    market.get("question")
-                    or market.get("title")
-                    or market.get("slug")
-                )
-
-    return None
 
 
 def resolve_outcomes_db():
@@ -835,7 +660,7 @@ def resolve_outcomes_db():
         if not winner:
             continue
 
-        teams = parse_team_names_from_history(teams_text)
+        teams = [t.split("@")[0].strip().lower() for t in teams_text.split("|")]
         winner_lower = winner.lower()
 
         top5_won = any(team in winner_lower or winner_lower in team for team in teams)
@@ -857,13 +682,12 @@ def resolve_outcomes_db():
     cur.close()
     conn.close()
 
-
 def update_stats_sheet_from_db(sheet):
     if not DATABASE_URL:
         print("DATABASE_URL fehlt – Stats werden übersprungen.")
         return
 
-    ws = get_or_create_worksheet(sheet, "Stats", rows=1000, cols=12)
+    ws = get_or_create_worksheet(sheet, "Stats", rows=1000, cols=10)
 
     conn = psycopg2.connect(DATABASE_URL)
 
@@ -874,7 +698,7 @@ def update_stats_sheet_from_db(sheet):
                 COUNT(*) FILTER (WHERE top5_won IS NOT NULL) AS resolved,
                 COUNT(*) FILTER (WHERE top5_won = true) AS wins,
                 COUNT(*) FILTER (WHERE top5_won = false) AS losses,
-                ROUND(AVG(best_roi)::numeric, 2) AS avg_real_roi
+                ROUND(AVG(best_roi)::numeric, 2) AS avg_roi
             FROM outcomes;
         """,
         "Nach Kategorie": """
@@ -889,7 +713,7 @@ def update_stats_sheet_from_db(sheet):
                     / NULLIF(COUNT(*) FILTER (WHERE top5_won IS NOT NULL), 0),
                     2
                 ) AS winrate_percent,
-                ROUND(AVG(best_roi)::numeric, 2) AS avg_real_roi
+                ROUND(AVG(best_roi)::numeric, 2) AS avg_roi
             FROM outcomes
             GROUP BY category
             ORDER BY total DESC;
@@ -911,7 +735,7 @@ def update_stats_sheet_from_db(sheet):
                     / NULLIF(COUNT(*) FILTER (WHERE top5_won IS NOT NULL), 0),
                     2
                 ) AS winrate_percent,
-                ROUND(AVG(best_roi)::numeric, 2) AS avg_real_roi
+                ROUND(AVG(best_roi)::numeric, 2) AS avg_roi
             FROM outcomes
             GROUP BY roi_range
             ORDER BY MIN(best_roi);
@@ -922,10 +746,11 @@ def update_stats_sheet_from_db(sheet):
 
     for title, query in queries.items():
         df = pd.read_sql_query(query, conn)
-        df = df.fillna("")
 
         all_rows.append([title])
         all_rows.append(df.columns.tolist())
+
+        df = df.fillna("")
 
         for _, row in df.iterrows():
             all_rows.append(row.astype(str).tolist())
@@ -939,7 +764,327 @@ def update_stats_sheet_from_db(sheet):
     ws.freeze(rows=1)
     ws.set_basic_filter()
 
+    ws.format("A1:J1", {
+        "backgroundColor": {"red": 0.12, "green": 0.31, "blue": 0.47},
+        "textFormat": {
+            "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+            "bold": True,
+        },
+    })
+
     print("✅ Stats Sheet aktualisiert.")
+
+def update_history_summary(sheet, df):
+    if df.empty:
+        return
+
+    ws = get_or_create_worksheet(sheet, "History Summary", rows=1000, cols=25)
+
+    try:
+        existing = pd.DataFrame(ws.get_all_records())
+    except Exception:
+        existing = pd.DataFrame()
+
+    snapshot_rows = []
+
+    grouped = df.groupby(["Kategorie", "Event", "Event Slug"], dropna=False)
+
+    for (category, event, slug), group in grouped:
+        roi = float(group["ROI %"].iloc[0])
+
+        if roi < MIN_HISTORY_ROI:
+            continue
+
+        top_sum = float(group[f"Summe Top {TOP_N}"].iloc[0])
+        profit = float(group["Profit $"].iloc[0])
+        link = group["Link"].iloc[0]
+        timestamp = group["Zeit"].iloc[0]
+
+        teams = " | ".join(
+            f"{row['Team / Markt']} @ {row['YES Preis']}"
+            for _, row in group.iterrows()
+        )
+
+        snapshot_rows.append({
+            "Snapshot": "Current",
+            "Kategorie": category,
+            "Event": event,
+            "Event Slug": slug,
+            "Zeit": timestamp,
+            "ROI %": roi,
+            f"Summe Top {TOP_N}": top_sum,
+            "Profit $": profit,
+            "Teams": teams,
+            "Top 5 gewonnen?": "",
+            "Gewinner": "",
+            "Link": link,
+        })
+
+    current = pd.DataFrame(snapshot_rows)
+
+    if current.empty and existing.empty:
+        ws.clear()
+        ws.update(values=[["Keine History-Spots mit ROI > 5% gefunden."]], range_name="A1")
+        return
+
+    if existing.empty or "Event Slug" not in existing.columns:
+        combined = current
+    else:
+        combined = pd.concat([existing, current], ignore_index=True)
+
+    combined = combined.drop_duplicates(
+        subset=["Event Slug", "Zeit"],
+        keep="last"
+    )
+
+    result_rows = []
+
+    for slug, group in combined.groupby("Event Slug"):
+        group = group[group["ROI %"].astype(float) >= MIN_HISTORY_ROI]
+
+        if group.empty:
+            continue
+
+        group = group.sort_values("ROI %")
+
+        lowest = group.iloc[0]
+        highest = group.iloc[-1]
+        middle = group.iloc[len(group) // 2]
+
+        for label, row in [
+            ("Lowest ROI > 5%", lowest),
+            ("Middle ROI", middle),
+            ("Highest ROI", highest),
+        ]:
+            result_rows.append({
+                "Snapshot": label,
+                "Kategorie": row["Kategorie"],
+                "Event": row["Event"],
+                "Event Slug": row["Event Slug"],
+                "Zeit": row["Zeit"],
+                "ROI %": row["ROI %"],
+                f"Summe Top {TOP_N}": row[f"Summe Top {TOP_N}"],
+                "Profit $": row["Profit $"],
+                "Teams": row["Teams"],
+                "Top 5 gewonnen?": row.get("Top 5 gewonnen?", ""),
+                "Gewinner": row.get("Gewinner", ""),
+                "Link": row["Link"],
+            })
+
+    result = pd.DataFrame(result_rows)
+
+    if result.empty:
+        ws.clear()
+        ws.update(values=[["Keine History-Spots mit ROI > 5% gefunden."]], range_name="A1")
+        return
+
+    result = result.sort_values(["Event", "Snapshot"])
+
+    ws.clear()
+    ws.update(
+        values=[result.columns.tolist()] + result.astype(str).values.tolist(),
+        range_name="A1"
+    )
+    format_history_summary(ws)
+
+    ws.freeze(rows=1)
+    ws.set_basic_filter()
+
+def update_outcome_history(sheet, df):
+    if df.empty:
+        return
+
+    ws = get_or_create_worksheet(sheet, "Outcome", rows=2000, cols=25)
+
+    try:
+        existing = pd.DataFrame(ws.get_all_records())
+    except Exception:
+        existing = pd.DataFrame()
+
+    rows = []
+
+    grouped = df.groupby(["Event", "Event Slug"], dropna=False)
+
+    for (event, slug), group in grouped:
+        roi = float(group["ROI %"].iloc[0])
+
+        if roi < MIN_HISTORY_ROI:
+            continue
+
+        timestamp = group["Zeit"].iloc[0]
+        top_sum = float(group[f"Summe Top {TOP_N}"].iloc[0])
+        link = group["Link"].iloc[0]
+
+        teams = " | ".join(
+            f"{row['Team / Markt']} @ {row['YES Preis']}"
+            for _, row in group.iterrows()
+        )
+
+        rows.append({
+            "Zeit": timestamp,
+            "Event": event,
+            "Event Slug": slug,
+            "ROI %": roi,
+            f"Summe Top {TOP_N}": top_sum,
+            "Teams": teams,
+            "Gewinner": "",
+            "Top 5 gewonnen?": "",
+            "Link": link,
+        })
+
+    new_df = pd.DataFrame(rows)
+
+    if existing.empty:
+        combined = new_df
+    else:
+        combined = pd.concat([existing, new_df], ignore_index=True)
+
+    combined["ROI %"] = combined["ROI %"].astype(float)
+
+    combined = (
+        combined.sort_values("ROI %", ascending=False)
+        .drop_duplicates(subset=["Event Slug"], keep="first")
+        )
+
+    ws.clear()
+    ws.update(
+        values=[combined.columns.tolist()] + combined.astype(str).values.tolist(),
+        range_name="A1"
+    )
+
+    ws.freeze(rows=1)
+    ws.set_basic_filter()
+
+def resolve_outcome(sheet):
+    ws = get_or_create_worksheet(sheet, "Outcome", rows=2000, cols=25)
+
+    try:
+        df = pd.DataFrame(ws.get_all_records())
+    except Exception:
+        return
+
+    if df.empty:
+        return
+
+    changed = False
+
+    for idx, row in df.iterrows():
+        if row.get("Top 5 gewonnen?"):
+            continue
+
+        slug = row.get("Event Slug")
+        event = fetch_event_by_slug(slug)
+
+        winner = detect_resolved_winner(event)
+
+        if not winner:
+            continue
+
+        teams = parse_team_names_from_history(row["Teams"])
+
+        winner_lower = winner.lower()
+
+        top5 = any(team in winner_lower for team in teams)
+
+        df.at[idx, "Gewinner"] = winner
+        df.at[idx, "Top 5 gewonnen?"] = "TRUE" if top5 else "FALSE"
+
+        changed = True
+
+    if changed:
+        ws.clear()
+        ws.update(
+            values=[df.columns.tolist()] + df.astype(str).values.tolist(),
+            range_name="A1"
+        )
+
+def parse_team_names_from_history(teams_text):
+    teams = []
+
+    for part in str(teams_text).split("|"):
+        name = part.split("@")[0].strip()
+        if name:
+            teams.append(name.lower())
+
+    return teams
+
+
+def detect_resolved_winner(event):
+    if not event:
+        return None
+
+    markets = event.get("markets", [])
+
+    for market in markets:
+        yes_price = get_yes_price(market)
+
+        if yes_price is None:
+            continue
+
+        if yes_price >= 0.98:
+            return (
+                market.get("question")
+                or market.get("title")
+                or market.get("slug")
+            )
+
+    return None
+
+
+def resolve_history_results(sheet):
+    ws = get_or_create_worksheet(sheet, "History Summary", rows=1000, cols=25)
+
+    try:
+        df = pd.DataFrame(ws.get_all_records())
+    except Exception:
+        return
+
+    if df.empty or "Event Slug" not in df.columns:
+        return
+
+    changed = False
+    event_cache = {}
+
+    for idx, row in df.iterrows():
+        current_status = str(row.get("Top 5 gewonnen?", "")).strip()
+
+        if current_status:
+            continue
+
+        slug = row.get("Event Slug")
+
+        if not slug:
+            continue
+
+        if slug not in event_cache:
+            event_cache[slug] = fetch_event_by_slug(slug)
+
+        event = event_cache[slug]
+        winner = detect_resolved_winner(event)
+
+        if not winner:
+            continue
+
+        top_teams = parse_team_names_from_history(row.get("Teams", ""))
+        winner_lower = winner.lower()
+
+        top5_won = any(team in winner_lower or winner_lower in team for team in top_teams)
+
+        df.at[idx, "Gewinner"] = winner
+        df.at[idx, "Top 5 gewonnen?"] = "JA" if top5_won else "NEIN"
+        changed = True
+
+    if changed:
+        ws.clear()
+        ws.update(
+            values=[df.columns.tolist()] + df.astype(str).values.tolist(),
+            range_name="A1"
+        )
+        ws.freeze(rows=1)
+        ws.set_basic_filter()
+        print("✅ History Results aktualisiert.")
+    else:
+        print("Keine neuen resolved History-Ergebnisse gefunden.")
 
 
 # =====================
@@ -947,26 +1092,30 @@ def update_stats_sheet_from_db(sheet):
 # =====================
 
 def main():
-    print("Starte Polymarket Scanner mit realem Orderbook-ROI...")
+    print("Starte Polymarket Scanner...")
 
     df = build_opportunities()
     print("Gefundene Zeilen:", len(df))
 
+    # Datenbank
     init_db()
     save_outcome_to_db(df)
     resolve_outcomes_db()
 
+    # Google Sheet
     sheet = connect_google_sheet()
     print("Google Sheet geöffnet:", sheet.title)
+    update_stats_sheet_from_db(sheet)
 
     opportunities_ws = get_or_create_worksheet(sheet, "Opportunities")
     write_dataframe_to_sheet(opportunities_ws, df)
-    format_opportunities_sheet(opportunities_ws)
+    format_google_sheet(opportunities_ws)
     color_events_and_roi(opportunities_ws, df)
 
+    # History / Outcome im Sheet
     update_history_summary(sheet, df)
-    update_stats_sheet_from_db(sheet)
 
+    # Status
     status_ws = get_or_create_worksheet(sheet, "Status", rows=20, cols=5)
     status_ws.clear()
     status_ws.update(values=[
@@ -974,13 +1123,11 @@ def main():
         ["Gefundene Zeilen", len(df)],
         ["Bankroll pro Spot", BANKROLL],
         ["Top N", TOP_N],
-        ["Min Real ROI", MIN_RAW_ROI],
+        ["Min ROI", MIN_RAW_ROI],
         ["Min History ROI %", MIN_HISTORY_ROI],
-        ["ROI Basis", "Orderbook depth / real execution"],
     ], range_name="A1")
 
     print("✅ Google Sheet erfolgreich aktualisiert.")
-
 
 if __name__ == "__main__":
     main()
