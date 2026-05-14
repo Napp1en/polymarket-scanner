@@ -127,7 +127,7 @@ def get_event_category(event):
 
 def get_events(limit=EVENT_LIMIT, max_pages=MAX_PAGES):
     events_by_id = {}
-    orders = ["volume_24hr", "volume", "liquidity", "start_date", "end_date"]
+    orders = ["volume_24hr", "volume", "liquidity"]
 
     for order in orders:
         print(f"Lade Events nach: {order}")
