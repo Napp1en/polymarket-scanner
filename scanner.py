@@ -20,7 +20,7 @@ MIN_RAW_ROI = 0.05
 MIN_HISTORY_ROI = 5.0
 
 EVENT_LIMIT = 250
-MAX_PAGES = 4
+MAX_PAGES = 8
 
 EVENTS_URL = "https://gamma-api.polymarket.com/events"
 
@@ -127,7 +127,7 @@ def get_event_category(event):
 
 def get_events(limit=EVENT_LIMIT, max_pages=MAX_PAGES):
     events_by_id = {}
-    orders = ["volume_24hr", "volume", "liquidity"]
+    orders = ["volume_24hr", "volume", "liquidity", "start_date", "end_date"]
 
     for order in orders:
         print(f"Lade Events nach: {order}")
