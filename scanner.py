@@ -19,7 +19,7 @@ TOP_N = 5
 MIN_RAW_ROI = 0.05
 MIN_HISTORY_ROI = 5.0
 
-EVENT_LIMIT = 250
+EVENT_LIMIT = 100
 MAX_PAGES = 8
 
 EVENTS_URL = "https://gamma-api.polymarket.com/events"
@@ -127,10 +127,11 @@ def get_event_category(event):
 
 def get_events(limit=EVENT_LIMIT, max_pages=MAX_PAGES):
     events_by_id = {}
-    orders = ["volume_24hr", "volume", "liquidity"]
+
+    orders = ["volume_24hr", "volume", "liquidity", "start_date", "end_date"]
 
     for order in orders:
-        print(f"Lade Events nach: {order}")
+        print(f"Lade Events nach: {order}", flush=True)
 
         for page in range(max_pages):
             params = {
@@ -144,7 +145,10 @@ def get_events(limit=EVENT_LIMIT, max_pages=MAX_PAGES):
 
             r = requests.get(EVENTS_URL, params=params, timeout=20)
             r.raise_for_status()
+
             batch = r.json()
+
+            print(f"  Seite {page + 1}: {len(batch)} Events", flush=True)
 
             if not batch:
                 break
@@ -153,9 +157,8 @@ def get_events(limit=EVENT_LIMIT, max_pages=MAX_PAGES):
                 event_id = e.get("id") or e.get("slug")
                 events_by_id[event_id] = e
 
-            print(f"  Seite {page + 1}: {len(batch)} Events")
-
-            if len(batch) < limit:
+            # Nur abbrechen, wenn wirklich weniger als 100 zurückkommt
+            if len(batch) < 100:
                 break
 
     return list(events_by_id.values())
