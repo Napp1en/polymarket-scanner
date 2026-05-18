@@ -544,6 +544,32 @@ def build_opportunities():
 # History
 # =====================
 
+def migrate_db():
+    if not DATABASE_URL:
+        return
+
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+
+    try:
+        cur.execute("ALTER TABLE outcomes ADD COLUMN real_payout FLOAT;")
+    except:
+        pass
+
+    try:
+        cur.execute("ALTER TABLE outcomes ADD COLUMN real_profit FLOAT;")
+    except:
+        pass
+
+    try:
+        cur.execute("ALTER TABLE outcomes ADD COLUMN real_cost FLOAT;")
+    except:
+        pass
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
 def init_db():
     if not DATABASE_URL:
         print("DATABASE_URL fehlt – DB wird übersprungen.")
@@ -1143,6 +1169,8 @@ def main():
     print("Gefundene Zeilen:", len(df))
 
     # Datenbank
+    init_db()
+    migrate_db()
     init_db()
     save_outcome_to_db(df)
     resolve_outcomes_db()
