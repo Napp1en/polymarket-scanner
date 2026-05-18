@@ -777,6 +777,48 @@ def update_stats_sheet_from_db(sheet):
 
     print("✅ Stats Sheet aktualisiert.")
 
+def update_db_outcomes_sheet(sheet):
+    if not DATABASE_URL:
+        return
+
+    ws = get_or_create_worksheet(sheet, "DB Outcomes", rows=1000, cols=12)
+
+    conn = psycopg2.connect(DATABASE_URL)
+
+    query = """
+        SELECT
+            category,
+            event,
+            best_roi,
+            top_sum,
+            real_payout,
+            real_profit,
+            winner,
+            top5_won,
+            last_updated
+        FROM outcomes
+        ORDER BY best_roi DESC;
+    """
+
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+
+    df = df.fillna("")
+
+    ws.clear()
+
+    if df.empty:
+        ws.update(values=[["Keine DB Outcomes vorhanden."]], range_name="A1")
+        return
+
+    ws.update(
+        values=[df.columns.tolist()] + df.astype(str).values.tolist(),
+        range_name="A1"
+    )
+
+    ws.freeze(rows=1)
+    ws.set_basic_filter()
+
 def update_history_summary(sheet, df):
     if df.empty:
         return
@@ -1109,6 +1151,7 @@ def main():
     sheet = connect_google_sheet()
     print("Google Sheet geöffnet:", sheet.title)
     update_stats_sheet_from_db(sheet)
+    update_db_outcomes_sheet(sheet)
 
     opportunities_ws = get_or_create_worksheet(sheet, "Opportunities")
     write_dataframe_to_sheet(opportunities_ws, df)
