@@ -1,3 +1,1 @@
-git add runtime.txt
-git commit -m "pin python runtime"
-git push
+3.11
