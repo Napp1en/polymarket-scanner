@@ -41,9 +41,6 @@ CATEGORIES = {
         "lec winner",
         "lpl winner"
     ],
-    "Dota 2": [
-        "dota", "the international", "dreamleague", "riyadh masters"
-    ],
     "Valorant": [
         "valorant", "vct", "valorant champions", "masters valorant"
     ],
