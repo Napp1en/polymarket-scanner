@@ -122,44 +122,70 @@ def get_event_category(event):
     return None
 
 
-def get_events(limit=EVENT_LIMIT, max_pages=MAX_PAGES):
+def get_events(limit=100, max_pages=8):
     events_by_id = {}
 
-    orders = ["volume_24hr", "volume", "liquidity", "start_date", "end_date"]
+    # Erst ohne Sortierung laden.
+    # So vermeiden wir 422-Fehler durch ungültige order-Felder.
+    for page in range(max_pages):
+        params = {
+            "active": "true",
+            "closed": "false",
+            "limit": limit,
+            "offset": page * limit,
+        }
 
-    for order in orders:
-        print(f"Lade Events nach: {order}", flush=True)
+        print(f"Lade Event-Seite {page + 1} ...", flush=True)
 
-        for page in range(max_pages):
-            params = {
-                "active": "true",
-                "closed": "false",
-                "limit": limit,
-                "offset": page * limit,
-                "order": order,
-                "ascending": "false",
-            }
+        try:
+            r = requests.get(
+                EVENTS_URL,
+                params=params,
+                timeout=30
+            )
 
-            r = requests.get(EVENTS_URL, params=params, timeout=20)
-            r.raise_for_status()
+            if r.status_code != 200:
+                print(
+                    f"Gamma API Fehler {r.status_code}: "
+                    f"{r.text[:500]}",
+                    flush=True
+                )
+                break
 
             batch = r.json()
 
-            print(f"  Seite {page + 1}: {len(batch)} Events", flush=True)
+        except requests.RequestException as e:
+            print(f"Netzwerkfehler beim Laden der Events: {e}", flush=True)
+            break
+        except ValueError as e:
+            print(f"Ungültige JSON-Antwort: {e}", flush=True)
+            break
 
-            if not batch:
-                break
+        print(
+            f"  Seite {page + 1}: {len(batch)} Events",
+            flush=True
+        )
 
-            for e in batch:
-                event_id = e.get("id") or e.get("slug")
-                events_by_id[event_id] = e
+        if not batch:
+            break
 
-            # Nur abbrechen, wenn wirklich weniger als 100 zurückkommt
-            if len(batch) < 100:
-                break
+        for event in batch:
+            event_id = event.get("id") or event.get("slug")
 
-    return list(events_by_id.values())
+            if event_id:
+                events_by_id[event_id] = event
 
+        if len(batch) < limit:
+            break
+
+    events = list(events_by_id.values())
+
+    print(
+        f"Insgesamt eindeutige Events geladen: {len(events)}",
+        flush=True
+    )
+
+    return events
 
 def fetch_event_by_slug(slug):
     for closed in ["false", "true"]:
