@@ -103,12 +103,22 @@ def parse_list(value):
 
 
 def event_text(event):
+    tags = event.get("tags") or []
+
+    tag_text = " ".join(
+        f"{tag.get('label', '')} {tag.get('slug', '')}"
+        for tag in tags
+        if isinstance(tag, dict)
+    )
+
     return " ".join([
         str(event.get("title", "")),
         str(event.get("slug", "")),
         str(event.get("description", "")),
         str(event.get("seriesSlug", "")),
         str(event.get("category", "")),
+        str(event.get("subcategory", "")),
+        tag_text,
     ]).lower()
 
 
