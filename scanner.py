@@ -132,7 +132,7 @@ def get_event_category(event):
     return None
 
 
-def get_events(limit=100, max_pages=10):
+def get_events(limit=100, max_pages=20):
     events_by_id = {}
 
     for page in range(max_pages):
