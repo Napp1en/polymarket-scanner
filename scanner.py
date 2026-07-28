@@ -132,11 +132,9 @@ def get_event_category(event):
     return None
 
 
-def get_events(limit=100, max_pages=8):
+def get_events(limit=100, max_pages=10):
     events_by_id = {}
 
-    # Erst ohne Sortierung laden.
-    # So vermeiden wir 422-Fehler durch ungültige order-Felder.
     for page in range(max_pages):
         params = {
             "active": "true",
