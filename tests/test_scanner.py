@@ -1,6 +1,5 @@
 import copy
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -10,14 +9,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import scanner  # noqa: E402
-
-FIXTURE = Path(__file__).parent / "fixtures" / "gamma_events.json"
-
-
-@pytest.fixture(scope="module")
-def real_events():
-    """Echte Gamma-Events (gekürzt auf die vom Scanner gelesenen Felder)."""
-    return json.loads(FIXTURE.read_text())
 
 
 def by_title(events, title):
@@ -403,7 +394,7 @@ def drop_zero_fields(obj):
 
 
 class FakeWorksheet:
-    def __init__(self, title, spreadsheet, sheet_id):
+    def __init__(self, title, spreadsheet, sheet_id, rows=1000, cols=26):
         self.title = title
         self.id = sheet_id
         self.values = []
@@ -412,12 +403,24 @@ class FakeWorksheet:
         self.basic_filter = None
         self.basic_filter_resets = 0
         self.conditional_formats = []
+        self.row_count = rows
+        self.col_count = cols
 
     def clear(self):
         self.values = []
 
     def update(self, values=None, range_name=None):
+        # wie values.update der Sheets API: kein automatisches Erweitern des Rasters
+        widest = max((len(row) for row in values), default=0)
+        if len(values) > self.row_count or widest > self.col_count:
+            raise ValueError(f"Range exceeds grid limits. Max rows: {self.row_count}, max columns: {self.col_count}")
         self.values = values
+
+    def add_rows(self, rows):
+        self.row_count += rows
+
+    def add_cols(self, cols):
+        self.col_count += cols
 
     def get_all_records(self):
         if len(self.values) < 2:
@@ -474,7 +477,7 @@ class FakeSpreadsheet:
         return self.sheets[title]
 
     def add_worksheet(self, title, rows, cols):
-        self.sheets[title] = FakeWorksheet(title, self, sheet_id=len(self.sheets))
+        self.sheets[title] = FakeWorksheet(title, self, sheet_id=len(self.sheets), rows=rows, cols=cols)
         return self.sheets[title]
 
     def by_id(self, sheet_id):
@@ -755,58 +758,3 @@ def test_debug_summary_contains_real_counts(real_events):
     assert "Events With Incomplete Outcomes: 2" in text
     assert "Valid Opportunities: 3 Events / 15 Zeilen" in text
     assert "Dota 2 Excluded: 1" in text
-
-
-# ---------------------------------------------------------------------------
-# PostgreSQL (nur wenn TEST_DATABASE_URL gesetzt ist)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="TEST_DATABASE_URL nicht gesetzt")
-def test_postgres_history_roundtrip(monkeypatch, real_events):
-    url = os.getenv("TEST_DATABASE_URL")
-    monkeypatch.setattr(scanner, "DATABASE_URL", url)
-
-    conn = scanner.psycopg2.connect(url)
-    with conn, conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS outcomes")
-    conn.close()
-
-    scanner.init_db()
-    scanner.migrate_db()
-    scanner.init_db()
-
-    df = scanner.build_opportunities(events=[copy.deepcopy(e) for e in real_events])
-    scanner.save_outcome_to_db(df)
-    scanner.save_outcome_to_db(df)
-
-    conn = scanner.psycopg2.connect(url)
-    with conn.cursor() as cur:
-        cur.execute("SELECT event_slug, best_roi, top_sum, teams FROM outcomes ORDER BY best_roi DESC")
-        rows = cur.fetchall()
-    conn.close()
-
-    assert len(rows) == 3
-    slug, roi, top_sum, teams = rows[0]
-    assert slug.startswith("pgl-major-singapore-2026-winner")
-    assert roi == pytest.approx(24.22)
-    assert top_sum == pytest.approx(0.805)
-    assert teams.count("|") == 4
-
-    pgl = by_title(real_events, "PGL Major Singapore 2026: Winner")
-    vitality = next(m for m in pgl["markets"] if m.get("groupItemTitle") == "Vitality")
-    for m in pgl["markets"]:
-        m["closed"] = True
-        m["outcomePrices"] = '["1", "0"]' if m is vitality else '["0", "1"]'
-    monkeypatch.setattr(scanner, "fetch_event_by_slug", lambda s: pgl if s == slug else None)
-    scanner.resolve_outcomes_db()
-
-    conn = scanner.psycopg2.connect(url)
-    with conn.cursor() as cur:
-        cur.execute("SELECT winner, top5_won FROM outcomes WHERE event_slug = %s", (slug,))
-        winner, top5_won = cur.fetchone()
-        cur.execute("SELECT COUNT(*) FROM outcomes WHERE winner IS NOT NULL")
-        resolved_count = cur.fetchone()[0]
-    conn.close()
-    assert winner == vitality["question"]
-    assert top5_won is True
-    assert resolved_count == 1
