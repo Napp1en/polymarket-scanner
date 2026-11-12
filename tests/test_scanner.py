@@ -390,14 +390,28 @@ def test_total_api_failure_aborts_before_sheets_are_touched(monkeypatch):
 # Google Sheets (gemockt)
 # ---------------------------------------------------------------------------
 
+def drop_zero_fields(obj):
+    """Wie die Sheets API (proto3-JSON): Felder mit Wert 0 fehlen in Antworten."""
+    if isinstance(obj, dict):
+        return {
+            k: drop_zero_fields(v) for k, v in obj.items()
+            if not (isinstance(v, (int, float)) and not isinstance(v, bool) and v == 0)
+        }
+    if isinstance(obj, list):
+        return [drop_zero_fields(v) for v in obj]
+    return obj
+
+
 class FakeWorksheet:
-    def __init__(self, title):
+    def __init__(self, title, spreadsheet, sheet_id):
         self.title = title
-        self.id = abs(hash(title)) % 10000
+        self.id = sheet_id
         self.values = []
         self.formats = []
-        self.spreadsheet = self
-        self.batch_requests = []
+        self.spreadsheet = spreadsheet
+        self.basic_filter = None
+        self.basic_filter_resets = 0
+        self.conditional_formats = []
 
     def clear(self):
         self.values = []
@@ -421,14 +435,29 @@ class FakeWorksheet:
     def freeze(self, rows=0):
         pass
 
-    def set_basic_filter(self):
-        pass
+    def set_basic_filter(self, name=None):
+        # gspread ohne Range: Filter über das ganze Blatt, ohne Kriterien
+        self.basic_filter = {"range": {"sheetId": self.id}}
+        self.basic_filter_resets += 1
 
     def format(self, rng, fmt):
         self.formats.append(rng)
 
-    def batch_update(self, body):
-        self.batch_requests.extend(body["requests"])
+    def visible_data_rows(self):
+        """Datenzeilen, die der aktuelle Basic-Filter anzeigt."""
+        rows = self.values[1:]
+        specs = (self.basic_filter or {}).get("filterSpecs") or []
+        visible = []
+        for row in rows:
+            shown = True
+            for spec in specs:
+                col = spec.get("columnIndex", 0)
+                value = str(row[col]) if col < len(row) else ""
+                if value in (spec["filterCriteria"].get("hiddenValues") or []):
+                    shown = False
+            if shown:
+                visible.append(row)
+        return visible
 
 
 class FakeSpreadsheet:
@@ -436,6 +465,8 @@ class FakeSpreadsheet:
 
     def __init__(self):
         self.sheets = {}
+        self.requests = []
+        self.fail_metadata = False
 
     def worksheet(self, title):
         if title not in self.sheets:
@@ -443,8 +474,47 @@ class FakeSpreadsheet:
         return self.sheets[title]
 
     def add_worksheet(self, title, rows, cols):
-        self.sheets[title] = FakeWorksheet(title)
+        self.sheets[title] = FakeWorksheet(title, self, sheet_id=len(self.sheets))
         return self.sheets[title]
+
+    def by_id(self, sheet_id):
+        return next(ws for ws in self.sheets.values() if ws.id == sheet_id)
+
+    def batch_update(self, body):
+        for req in body["requests"]:
+            self.requests.append(copy.deepcopy(req))
+            if "setBasicFilter" in req:
+                flt = copy.deepcopy(req["setBasicFilter"]["filter"])
+                self.by_id(flt["range"]["sheetId"]).basic_filter = flt
+            elif "addConditionalFormatRule" in req:
+                add = req["addConditionalFormatRule"]
+                ws = self.by_id(add["rule"]["ranges"][0]["sheetId"])
+                ws.conditional_formats.insert(add.get("index", 0), copy.deepcopy(add["rule"]))
+            elif "deleteConditionalFormatRule" in req:
+                delete = req["deleteConditionalFormatRule"]
+                self.by_id(delete["sheetId"]).conditional_formats.pop(delete["index"])
+
+    def fetch_sheet_metadata(self, params=None):
+        if self.fail_metadata:
+            raise RuntimeError("quota exceeded")
+        title = params["ranges"].strip("'").replace("''", "'")
+        ws = self.sheets[title]
+        basic_filter = copy.deepcopy(ws.basic_filter)
+        if basic_filter and basic_filter.get("filterSpecs"):
+            basic_filter["criteria"] = {
+                str(s.get("columnIndex", 0)): s["filterCriteria"] for s in basic_filter["filterSpecs"]
+            }
+        sheet_meta = {
+            "properties": {"sheetId": ws.id},
+            "conditionalFormats": copy.deepcopy(ws.conditional_formats),
+            "data": [{"rowData": [
+                {"values": [{"formattedValue": str(v)} if str(v) else {} for v in row]}
+                for row in ws.values
+            ]}],
+        }
+        if basic_filter:
+            sheet_meta["basicFilter"] = basic_filter
+        return drop_zero_fields({"sheets": [sheet_meta]})
 
 
 def test_opportunities_reach_google_sheets(monkeypatch, real_events):
@@ -468,9 +538,16 @@ def test_opportunities_reach_google_sheets(monkeypatch, real_events):
     assert len(slugs) == 3
     assert len(rows) == 5 + 5 + 5
 
-    roi_rule = next(r for r in sheet.sheets["Opportunities"].batch_requests if "addConditionalFormatRule" in r)
-    rng = roi_rule["addConditionalFormatRule"]["rule"]["ranges"][0]
+    opp_ws = sheet.sheets["Opportunities"]
+    assert len(opp_ws.conditional_formats) == 1
+    rng = opp_ws.conditional_formats[0]["ranges"][0]
     assert rng["startColumnIndex"] == header.index("ROI %")
+
+    assert opp_ws.basic_filter_resets == 0
+    assert opp_ws.basic_filter["range"] == {
+        "sheetId": opp_ws.id, "startRowIndex": 0, "endRowIndex": len(rows) + 1,
+        "startColumnIndex": 0, "endColumnIndex": len(header),
+    }
 
     history = sheet.sheets["History Summary"].values
     assert history[0][0] == "Snapshot"
@@ -480,10 +557,184 @@ def test_opportunities_reach_google_sheets(monkeypatch, real_events):
     assert status["Gefundene Zeilen"] == 15
 
 
-def test_empty_scan_writes_placeholder_text():
-    ws = FakeWorksheet("Opportunities")
+def test_empty_scan_keeps_header_row_for_filter():
+    sheet = FakeSpreadsheet()
+    ws = sheet.add_worksheet("Opportunities", 1000, 25)
+    empty = scanner.build_opportunities(events=[])
+
+    assert scanner.write_dataframe_to_sheet(ws, empty) == 0
+    assert ws.values == [scanner.OPPORTUNITY_COLUMNS + ["", "Keine passenden Spots gefunden."]]
+    assert ws.get_all_records() == []
+
+    ws.values = []
     assert scanner.write_dataframe_to_sheet(ws, pd.DataFrame()) == 0
     assert ws.values == [["Keine passenden Spots gefunden."]]
+
+
+# ---------------------------------------------------------------------------
+# Kategorie-Filter im Opportunities-Tab
+# ---------------------------------------------------------------------------
+
+def lol_event():
+    return event(
+        "LoL MSI 2027 Winner",
+        [market(n, p) for n, p in [("Gen.G", 0.3), ("T1", 0.2), ("BLG", 0.15), ("HLE", 0.1), ("G2", 0.1), ("FLY", 0.05)]],
+        tags=("league-of-legends", "esports"),
+    )
+
+
+def run_main(monkeypatch, sheet, events):
+    monkeypatch.setattr(scanner, "get_events", lambda stats=None: [copy.deepcopy(e) for e in events])
+    monkeypatch.setattr(scanner, "connect_google_sheet", lambda: sheet)
+    monkeypatch.setattr(scanner, "DATABASE_URL", None)
+    scanner.main()
+    return sheet.sheets["Opportunities"]
+
+
+def category_index():
+    return scanner.OPPORTUNITY_COLUMNS.index(scanner.CATEGORY_COLUMN)
+
+
+def test_every_opportunity_has_a_valid_category(real_events):
+    df = scanner.build_opportunities(events=[copy.deepcopy(e) for e in real_events] + [lol_event()])
+
+    assert not df.empty
+    assert df["Kategorie"].notna().all()
+    assert set(df["Kategorie"]) <= set(scanner.CATEGORIES)
+    assert set(df["Kategorie"]) == {"CS2", "Fußball", "LoL"}
+    assert not df["Event"].str.contains("Dota|BLAST Slam", case=False).any()
+
+
+def test_category_selection_survives_scanner_updates(monkeypatch, real_events):
+    sheet = FakeSpreadsheet()
+    ws = run_main(monkeypatch, sheet, real_events)
+    assert ws.basic_filter.get("filterSpecs") is None
+    assert {r[category_index()] for r in ws.values[1:]} == {"CS2", "Fußball"}
+
+    # Nutzer wählt im Sheet "nur CS2" (Sheets speichert die ausgeblendeten Werte)
+    ws.basic_filter["filterSpecs"] = [
+        {"columnIndex": category_index(), "filterCriteria": {"hiddenValues": ["Fußball"]}}
+    ]
+    assert {r[category_index()] for r in ws.visible_data_rows()} == {"CS2"}
+
+    # Nächster Lauf bringt zusätzlich eine LoL-Opportunity
+    ws = run_main(monkeypatch, sheet, real_events + [lol_event()])
+
+    assert len(ws.values) - 1 == 20
+    assert {r[category_index()] for r in ws.values[1:]} == {"CS2", "Fußball", "LoL"}
+    specs = ws.basic_filter["filterSpecs"]
+    assert len(specs) == 1
+    assert specs[0]["columnIndex"] == category_index()
+    hidden = set(specs[0]["filterCriteria"]["hiddenValues"])
+    assert "CS2" not in hidden
+    assert {"Fußball", "LoL", "Valorant"} <= hidden
+    assert {r[category_index()] for r in ws.visible_data_rows()} == {"CS2"}
+    assert ws.basic_filter["range"]["endRowIndex"] == 21
+    assert ws.basic_filter_resets == 0
+
+    # "Alle Kategorien": Nutzer entfernt die Auswahl -> bleibt nach dem Update ohne Kriterien
+    ws.basic_filter.pop("filterSpecs")
+    ws = run_main(monkeypatch, sheet, real_events + [lol_event()])
+    assert ws.basic_filter.get("filterSpecs") is None
+    assert len(ws.visible_data_rows()) == 20
+
+
+def test_filter_criteria_follow_column_name_and_zero_index():
+    header = list(scanner.OPPORTUNITY_COLUMNS)
+    old_header = ["Event", "Zeit", "Foo", "Kategorie"]
+    state = {
+        "basic_filter": {"filterSpecs": [
+            {"columnIndex": 3, "filterCriteria": {"hiddenValues": ["LoL"]}},
+            # columnIndex 0 fehlt in API-Antworten
+            {"filterCriteria": {"condition": {"type": "TEXT_CONTAINS", "values": [{"userEnteredValue": "Major"}]}}},
+            {"columnIndex": 2, "filterCriteria": {"hiddenValues": ["x"]}},
+        ]},
+        "values": [old_header, ["E1", "t", "x", "LoL"], ["E2", "t", "y", "CS2"]],
+    }
+    df = pd.DataFrame({"Kategorie": ["CS2", "Fußball"]})
+
+    specs = scanner.carry_over_filter_specs(state, header, df)
+
+    assert specs[0]["columnIndex"] == header.index("Kategorie")
+    assert set(specs[0]["filterCriteria"]["hiddenValues"]) == set(scanner.CATEGORIES) - {"CS2"}
+    assert specs[1]["columnIndex"] == header.index("Event")
+    assert specs[1]["filterCriteria"]["condition"]["type"] == "TEXT_CONTAINS"
+    assert len(specs) == 2
+
+
+def test_deprecated_criteria_map_is_supported():
+    header = list(scanner.OPPORTUNITY_COLUMNS)
+    state = {
+        "basic_filter": {"criteria": {"1": {"hiddenValues": ["Fußball"]}}},
+        "values": [header, ["t", "CS2"], ["t", "Fußball"]],
+    }
+    specs = scanner.carry_over_filter_specs(state, header, pd.DataFrame({"Kategorie": ["CS2"]}))
+    assert specs[0]["columnIndex"] == 1
+    assert "CS2" not in specs[0]["filterCriteria"]["hiddenValues"]
+
+
+def test_keep_visible_categories():
+    keep = scanner.keep_visible_categories
+    assert keep({}, ["CS2"], ["LoL"]) == {}
+    everything_hidden = {"hiddenValues": ["CS2"]}
+    assert keep(everything_hidden, ["CS2"], ["LoL"]) == everything_hidden
+    result = keep({"hiddenValues": ["LoL"], "visibleBackgroundColor": {"red": 1}}, ["CS2", "LoL"], ["Valorant"])
+    assert set(result["hiddenValues"]) == set(scanner.CATEGORIES) - {"CS2"}
+    assert result["visibleBackgroundColor"] == {"red": 1}
+
+
+def test_filter_survives_empty_scan(monkeypatch, real_events):
+    sheet = FakeSpreadsheet()
+    ws = run_main(monkeypatch, sheet, real_events)
+    ws.basic_filter["filterSpecs"] = [
+        {"columnIndex": category_index(), "filterCriteria": {"hiddenValues": ["Fußball"]}}
+    ]
+
+    ws = run_main(monkeypatch, sheet, [])
+    assert ws.values[0][:len(scanner.OPPORTUNITY_COLUMNS)] == scanner.OPPORTUNITY_COLUMNS
+    assert ws.basic_filter["range"]["endRowIndex"] == 1
+    assert ws.basic_filter["filterSpecs"][0]["columnIndex"] == category_index()
+
+    ws = run_main(monkeypatch, sheet, real_events)
+    assert {r[category_index()] for r in ws.visible_data_rows()} == {"CS2"}
+
+
+def test_roi_rule_is_replaced_not_duplicated(monkeypatch, real_events):
+    sheet = FakeSpreadsheet()
+    ws = run_main(monkeypatch, sheet, real_events)
+    user_rule = {
+        "ranges": [{"sheetId": ws.id, "startColumnIndex": 5, "endColumnIndex": 6}],
+        "booleanRule": {"condition": {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0.1"}]},
+                        "format": {"backgroundColor": {"red": 1}}},
+    }
+    ws.conditional_formats.append(user_rule)
+    # gespeicherte Farben sind auf 1/255 gerundet
+    ws.conditional_formats[0]["booleanRule"]["format"]["backgroundColor"] = {
+        "red": 184 / 255, "green": 224 / 255, "blue": 179 / 255,
+    }
+
+    for _ in range(3):
+        ws = run_main(monkeypatch, sheet, real_events)
+
+    scanner_rules = [r for r in ws.conditional_formats if scanner.is_scanner_roi_rule(r)]
+    assert len(scanner_rules) == 1
+    assert user_rule in ws.conditional_formats
+    assert len(ws.conditional_formats) == 2
+
+
+def test_unreadable_filter_state_does_not_break_update(monkeypatch, real_events):
+    sheet = FakeSpreadsheet()
+    ws = run_main(monkeypatch, sheet, real_events)
+    ws.basic_filter["filterSpecs"] = [
+        {"columnIndex": category_index(), "filterCriteria": {"hiddenValues": ["Fußball"]}}
+    ]
+    sheet.fail_metadata = True
+
+    ws = run_main(monkeypatch, sheet, real_events)
+
+    assert len(ws.values) - 1 == 15
+    assert ws.basic_filter.get("filterSpecs") is None
+    assert ws.basic_filter["range"]["endRowIndex"] == 16
 
 
 def test_detect_resolved_winner_requires_closed_market():
