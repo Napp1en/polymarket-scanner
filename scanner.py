@@ -747,16 +747,195 @@ def get_or_create_worksheet(sheet, title, rows=1000, cols=25):
         return sheet.add_worksheet(title=title, rows=rows, cols=cols)
 
 
+EMPTY_OPPORTUNITIES_TEXT = "Keine passenden Spots gefunden."
+
+
 def write_dataframe_to_sheet(ws, df):
     ws.clear()
 
     if df.empty:
-        ws.update(values=[["Keine passenden Spots gefunden."]], range_name="A1")
+        header = df.columns.tolist()
+        if header:
+            # Kopfzeile (= Filterzeile) bleibt stehen; Hinweis rechts außerhalb des Filterbereichs.
+            ws.update(values=[header + ["", EMPTY_OPPORTUNITIES_TEXT]], range_name="A1")
+        else:
+            ws.update(values=[[EMPTY_OPPORTUNITIES_TEXT]], range_name="A1")
         return 0
 
     values = [df.columns.tolist()] + df.astype(str).values.tolist()
     ws.update(values=values, range_name="A1")
     return len(values) - 1
+
+
+# =====================
+# Google Sheets Filter
+# =====================
+
+CATEGORY_COLUMN = "Kategorie"
+
+
+def quote_sheet_title(title):
+    return "'" + str(title).replace("'", "''") + "'"
+
+
+def read_sheet_state(ws):
+    """Basic-Filter, Conditional Formats und bisherigen Inhalt eines Tabs (1 API-Call).
+
+    Muss vor ws.clear() gelesen werden. Bei Fehlern {}: der Filter wird dann ohne
+    Auswahl neu gesetzt, der Scanner läuft weiter.
+    """
+    try:
+        meta = ws.spreadsheet.fetch_sheet_metadata(params={
+            "includeGridData": "true",
+            "ranges": quote_sheet_title(ws.title),
+            "fields": (
+                "sheets(properties(sheetId),basicFilter,conditionalFormats,"
+                "data(rowData(values(formattedValue))))"
+            ),
+        })
+    except Exception as e:
+        print(
+            f"⚠️ Filter-Status von '{ws.title}' nicht lesbar ({e}) – "
+            f"Filter wird ohne Auswahl neu gesetzt.",
+            flush=True,
+        )
+        return {}
+
+    for sheet_meta in meta.get("sheets", []):
+        # Die Sheets API lässt Felder mit Wert 0 weg (sheetId, columnIndex, ...).
+        if sheet_meta.get("properties", {}).get("sheetId", 0) != ws.id:
+            continue
+        values = [
+            [cell.get("formattedValue", "") for cell in row.get("values", [])]
+            for data in sheet_meta.get("data", [])
+            for row in data.get("rowData", [])
+        ]
+        return {
+            "basic_filter": sheet_meta.get("basicFilter") or {},
+            "conditional_formats": sheet_meta.get("conditionalFormats") or [],
+            "values": values,
+        }
+
+    return {}
+
+
+def keep_visible_categories(criteria, old_values, new_values):
+    """"Nach Werten filtern" speichert nur die ausgeblendeten Werte.
+
+    Ohne Anpassung würde eine Auswahl "nur CS2" eine später neu auftauchende Kategorie
+    anzeigen. Deshalb bleibt die bisher sichtbare Auswahl sichtbar, alles andere wird
+    ausgeblendet.
+    """
+    hidden = set(criteria.get("hiddenValues") or [])
+    if not hidden:
+        return criteria
+
+    visible = set(old_values) - hidden
+    if not visible:
+        return criteria
+
+    universe = set(CATEGORIES) | set(new_values) | set(old_values) | hidden
+    return {**criteria, "hiddenValues": sorted(universe - visible)}
+
+
+def carry_over_filter_specs(state, header, df):
+    """Überträgt die im Sheet gewählten Filterkriterien per Spaltenname auf die neuen Daten."""
+    basic_filter = state.get("basic_filter") or {}
+    specs = basic_filter.get("filterSpecs")
+    if not specs and basic_filter.get("criteria"):
+        specs = [
+            {"columnIndex": int(col), "filterCriteria": criteria}
+            for col, criteria in basic_filter["criteria"].items()
+        ]
+    if not specs:
+        return []
+
+    old_rows = state.get("values") or []
+    old_header = old_rows[0] if old_rows else []
+    old_header_known = any(name in header for name in old_header)
+    carried = []
+
+    for spec in specs:
+        criteria = spec.get("filterCriteria")
+        if not criteria:
+            continue
+
+        old_col = spec.get("columnIndex", 0)
+        name = old_header[old_col] if old_col < len(old_header) else None
+
+        if name in header:
+            new_col = header.index(name)
+        elif not old_header_known and old_col < len(header):
+            new_col, name = old_col, header[old_col]
+        else:
+            print(f"  Filter auf entfallener Spalte '{name}' wird verworfen.", flush=True)
+            continue
+
+        if name == CATEGORY_COLUMN:
+            old_values = [
+                row[old_col] for row in old_rows[1:]
+                if old_col < len(row) and row[old_col]
+            ]
+            new_values = df[CATEGORY_COLUMN].dropna().astype(str).tolist() if CATEGORY_COLUMN in df else []
+            criteria = keep_visible_categories(criteria, old_values, new_values)
+
+        carried.append({"columnIndex": new_col, "filterCriteria": criteria})
+
+    return carried
+
+
+def apply_basic_filter(ws, num_cols, num_rows, filter_specs):
+    """Setzt den Basic-Filter auf Kopfzeile + Datenzeilen und wendet ihn neu an.
+
+    Werte-Updates per API blenden Zeilen nicht neu ein/aus; erst setBasicFilter
+    wertet die Kriterien für die neuen Daten aus.
+    """
+    basic_filter = {
+        "range": {
+            "sheetId": ws.id,
+            "startRowIndex": 0,
+            "endRowIndex": num_rows + 1,
+            "startColumnIndex": 0,
+            "endColumnIndex": num_cols,
+        }
+    }
+    if filter_specs:
+        basic_filter["filterSpecs"] = filter_specs
+
+    ws.spreadsheet.batch_update({"requests": [{"setBasicFilter": {"filter": basic_filter}}]})
+
+
+def describe_filter(filter_specs, header, df):
+    if not filter_specs:
+        return "keine Auswahl aktiv (alle Kategorien sichtbar)"
+
+    parts = []
+    for spec in filter_specs:
+        name = header[spec["columnIndex"]]
+        hidden = spec["filterCriteria"].get("hiddenValues")
+        if name == CATEGORY_COLUMN and hidden is not None and CATEGORY_COLUMN in df:
+            visible = sorted(set(df[CATEGORY_COLUMN].astype(str)) - set(hidden))
+            parts.append(f"{name}: sichtbar = {', '.join(visible) or '-'}")
+        else:
+            parts.append(f"{name}: Kriterium übernommen")
+    return "; ".join(parts)
+
+
+def update_opportunities_sheet(sheet, df):
+    """Schreibt den Opportunities-Tab und erhält die im Sheet gewählte Filterauswahl."""
+    ws = get_or_create_worksheet(sheet, "Opportunities")
+    header = df.columns.tolist() or list(OPPORTUNITY_COLUMNS)
+
+    state = read_sheet_state(ws)
+    filter_specs = carry_over_filter_specs(state, header, df)
+
+    rows_written = write_dataframe_to_sheet(ws, df)
+    format_google_sheet(ws, num_cols=len(header))
+    color_events_and_roi(ws, df, existing_rules=state.get("conditional_formats"))
+    apply_basic_filter(ws, len(header), rows_written, filter_specs)
+
+    print(f"Opportunities-Filter: {describe_filter(filter_specs, header, df)}", flush=True)
+    return rows_written
 
 
 def column_letter(index):
@@ -775,8 +954,9 @@ def column_letter(index):
 def format_google_sheet(ws, num_cols=12):
     last_col = column_letter(max(num_cols, 12) - 1)
 
+    # Den Basic-Filter setzt apply_basic_filter() – ein set_basic_filter() ohne
+    # Kriterien hier würde die im Sheet gewählte Kategorie bei jedem Lauf löschen.
     ws.freeze(rows=1)
-    ws.set_basic_filter()
 
     ws.format(f"A1:{last_col}1", {
         "backgroundColor": {"red": 0.12, "green": 0.31, "blue": 0.47},
@@ -836,13 +1016,36 @@ def format_google_sheet(ws, num_cols=12):
     ws.spreadsheet.batch_update({"requests": requests})
 
 
-def color_events_and_roi(ws, df):
+ROI_HIGHLIGHT_THRESHOLD = "10"
+ROI_HIGHLIGHT_COLOR = {"red": 0.72, "green": 0.88, "blue": 0.70}
+
+
+def is_scanner_roi_rule(rule):
+    boolean_rule = rule.get("booleanRule") or {}
+    condition = boolean_rule.get("condition") or {}
+    values = condition.get("values") or [{}]
+    color = (boolean_rule.get("format") or {}).get("backgroundColor") or {}
+    # Sheets speichert Farben in 1/255-Schritten (0.72 -> 0.7215...).
+    return (
+        condition.get("type") == "NUMBER_GREATER"
+        and values[0].get("userEnteredValue") == ROI_HIGHLIGHT_THRESHOLD
+        and all(abs(color.get(c, 0) - v) < 0.01 for c, v in ROI_HIGHLIGHT_COLOR.items())
+    )
+
+
+def color_events_and_roi(ws, df, existing_rules=None):
     if df.empty:
         return
 
     num_cols = len(df.columns)
     roi_col = df.columns.get_loc("ROI %")
-    requests = []
+
+    # Die ROI-Regel des Scanners ersetzen statt bei jedem Lauf eine weitere anzuhängen.
+    stale_rule_indexes = [i for i, rule in enumerate(existing_rules or []) if is_scanner_roi_rule(rule)]
+    requests = [
+        {"deleteConditionalFormatRule": {"sheetId": ws.id, "index": index}}
+        for index in sorted(stale_rule_indexes, reverse=True)
+    ]
 
     event_colors = [
         {"red": 1.00, "green": 0.95, "blue": 0.80},
@@ -891,10 +1094,10 @@ def color_events_and_roi(ws, df):
                 "booleanRule": {
                     "condition": {
                         "type": "NUMBER_GREATER",
-                        "values": [{"userEnteredValue": "10"}],
+                        "values": [{"userEnteredValue": ROI_HIGHLIGHT_THRESHOLD}],
                     },
                     "format": {
-                        "backgroundColor": {"red": 0.72, "green": 0.88, "blue": 0.70},
+                        "backgroundColor": ROI_HIGHLIGHT_COLOR,
                         "textFormat": {"bold": True},
                     },
                 },
@@ -981,6 +1184,13 @@ def format_history_summary(ws):
 # =====================
 # Scanner
 # =====================
+
+OPPORTUNITY_COLUMNS = [
+    "Zeit", "Kategorie", "Event", "Event Slug", "Team / Markt", "YES Preis",
+    f"Summe Top {TOP_N}", "ROI %", "Stake $", "Payout $", "Profit $", "Link",
+    "Handelbare Outcomes", "Nicht handelbare Outcomes", "Summe alle YES", "Arbitrage-Typ",
+]
+
 
 def build_opportunities(events=None, stats=None):
     stats = stats if stats is not None else ScanStats()
@@ -1071,7 +1281,7 @@ def build_opportunities(events=None, stats=None):
                 "Arbitrage-Typ": evaluation["arbitrage_type"],
             })
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=OPPORTUNITY_COLUMNS)
 
     if not df.empty:
         df = df.drop_duplicates(subset=["Event Slug", "Team / Markt"], keep="first")
@@ -1738,10 +1948,7 @@ def main():
         update_stats_sheet_from_db(sheet)
         update_db_outcomes_sheet(sheet)
 
-        opportunities_ws = get_or_create_worksheet(sheet, "Opportunities")
-        stats.sheet_rows_written = write_dataframe_to_sheet(opportunities_ws, df)
-        format_google_sheet(opportunities_ws, num_cols=len(df.columns))
-        color_events_and_roi(opportunities_ws, df)
+        stats.sheet_rows_written = update_opportunities_sheet(sheet, df)
 
         # History / Outcome im Sheet
         update_history_summary(sheet, df)
