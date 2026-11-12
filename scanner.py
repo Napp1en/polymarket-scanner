@@ -1,5 +1,8 @@
 import os
+import re
 import json
+import time
+from collections import Counter
 import requests
 import pandas as pd
 import gspread
@@ -19,18 +22,46 @@ TOP_N = 5
 MIN_RAW_ROI = 0.05
 MIN_HISTORY_ROI = 5.0
 
+# Gamma liefert max. 100 Events pro Seite.
 EVENT_LIMIT = 100
-MAX_PAGES = 8
+# Max. Seiten pro Discovery-Abfrage (Tag-Abfragen brauchen aktuell 1-4 Seiten).
+MAX_PAGES = 10
+# Zusätzlicher Sicherheits-Scan: Top-Events nach 24h-Volumen (fängt Events ohne passende Tags).
+GENERAL_SCAN_PAGES = 5
 
 EVENTS_URL = "https://gamma-api.polymarket.com/events"
+# /events akzeptiert offset nur bis 2000 (danach HTTP 422) -> Keyset-Pagination nutzen.
+EVENTS_KEYSET_URL = "https://gamma-api.polymarket.com/events/keyset"
+MAX_OFFSET = 2000
+
+# Gamma-Tag "Games" markiert Einzelspiele (Match-Märkte) – für Turnier-Discovery irrelevant.
+GAMES_TAG_ID = 100639
+DISCOVERY_TAG_SLUGS = [
+    "counter-strike-2",
+    "cs2",
+    "league-of-legends",
+    "valorant",
+    "esports",
+    "soccer",
+]
+
+# Ein negRisk-Event, dessen handelbare Outcomes zusammen weniger als diesen Wert kosten,
+# während noch Platzhalter / Märkte ohne Preis offen sind, ist unvollständig: die fehlende
+# Wahrscheinlichkeit liegt bei nicht handelbaren Outcomes, der Basket-ROI wäre Fantasie.
+MIN_LIVE_PROBABILITY_SUM = 0.90
+# Ab diesem YES-Preis gilt ein geschlossener Markt als "YES aufgelöst" (Event entschieden).
+RESOLVED_YES_PRICE = 0.98
 
 SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
+# Fallback-Keywords (Wortgrenzen) auf Titel / Slug / Serie / Tags – NICHT auf die Beschreibung,
+# dort erzeugen Kürzel wie "iem" oder "pgl" massenhaft Fehltreffer ("Riemann", ...).
 CATEGORIES = {
     "CS2": [
-        "counter-strike", "counter strike", "cs2", "pgl", "blast premier",
-        "iem", "esl pro league", "fissure"
+        "counter-strike", "counter strike", "cs2", "csgo", "cs:go", "pgl major",
+        "blast premier", "blast rivals", "blast open", "blast bounty", "iem",
+        "esl pro league", "fissure"
     ],
     "LoL": [
         "league of legends",
@@ -39,7 +70,9 @@ CATEGORIES = {
         "msi league of legends",
         "lck winner",
         "lec winner",
-        "lpl winner"
+        "lpl winner",
+        "lol worlds",
+        "lck", "lec", "lpl",
     ],
     "Valorant": [
         "valorant", "vct", "valorant champions", "masters valorant"
@@ -54,9 +87,42 @@ CATEGORIES = {
         "serie a winner",
         "world cup winner",
         "euro winner",
+        "soccer", "uefa", "fifa", "champions league", "europa league",
+        "conference league", "premier league", "epl", "bundesliga", "la liga",
+        "laliga", "serie a", "ligue 1", "eredivisie", "primeira liga", "mls cup",
+        "copa libertadores", "copa america", "afcon", "dfb-pokal", "fa cup",
     ],
 }
 
+# Primäre Kategorie-Erkennung über Gamma-Tags (exakte Slugs bzw. Präfixe).
+CATEGORY_TAGS = {
+    "CS2": {"counter-strike-2", "counter-strike", "cs2", "csgo"},
+    "LoL": {"league-of-legends"},
+    "Valorant": {"valorant"},
+    "Fußball": {
+        "soccer", "ucl", "uefa-champions-league", "champions-league",
+        "europa-league", "uefa-europa-league", "uefa-conference-league",
+        "epl", "premier-league", "bundesliga", "la-liga", "serie-a",
+        "fifa-world-cup",
+    },
+}
+CATEGORY_TAG_PREFIXES = {
+    "LoL": ("lol-",),
+}
+
+# Andere Sportarten, die Fußball-Keywords enthalten ("Rugby League World Cup",
+# "Basketball Champions League", "T20 ... Champions League").
+NON_SOCCER_KEYWORDS = [
+    "rugby", "cricket", "t20", "basketball", "euroleague", "hockey", "handball",
+    "volleyball", "nfl", "nba", "nhl", "mlb", "lacrosse",
+]
+
+# Dota 2 bleibt komplett ausgeschlossen (Tags + Keywords), egal welche Kategorie sonst passt.
+DOTA_TAGS = {"dota-2", "dota", "dota2"}
+DOTA_KEYWORDS = ["dota", "dota 2", "the international", "dreamleague", "riyadh masters"]
+
+# EXCLUDE_KEYWORDS und TOURNAMENT_WORDS werden (mit Wortgrenzen) nur gegen den
+# Event-Titel geprüft. Auf der langen Beschreibung trifft z.B. "group " fast immer.
 EXCLUDE_KEYWORDS = [
     " vs ",
     "bo1",
@@ -102,96 +168,325 @@ def parse_list(value):
     return []
 
 
-def event_text(event):
-    tags = event.get("tags") or []
+def to_float(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
 
+
+def normalize_text(*parts):
+    text = " ".join(str(p) for p in parts if p).lower()
+    return f"{text} {text.replace('-', ' ')}"
+
+
+_KEYWORD_PATTERNS = {}
+
+
+def contains_keyword(text, keyword):
+    kw = keyword.strip().lower()
+    pattern = _KEYWORD_PATTERNS.get(kw)
+    if pattern is None:
+        pattern = re.compile(r"(?<![a-z0-9])" + re.escape(kw) + r"(?![a-z0-9])")
+        _KEYWORD_PATTERNS[kw] = pattern
+    return pattern.search(text) is not None
+
+
+def event_tags(event):
+    return [tag for tag in (event.get("tags") or []) if isinstance(tag, dict)]
+
+
+def event_tag_slugs(event):
+    return {str(tag.get("slug", "")).lower() for tag in event_tags(event) if tag.get("slug")}
+
+
+def event_text(event):
     tag_text = " ".join(
         f"{tag.get('label', '')} {tag.get('slug', '')}"
-        for tag in tags
-        if isinstance(tag, dict)
+        for tag in event_tags(event)
     )
 
-    return " ".join([
-        str(event.get("title", "")),
-        str(event.get("slug", "")),
-        str(event.get("description", "")),
-        str(event.get("seriesSlug", "")),
-        str(event.get("category", "")),
-        str(event.get("subcategory", "")),
+    return normalize_text(
+        event.get("title", ""),
+        event.get("slug", ""),
+        event.get("seriesSlug", ""),
+        event.get("category", ""),
+        event.get("subcategory", ""),
         tag_text,
-    ]).lower()
+    )
+
+
+def is_dota_event(event):
+    if event_tag_slugs(event) & DOTA_TAGS:
+        return True
+    text = normalize_text(event.get("title", ""), event.get("slug", ""), event.get("seriesSlug", ""))
+    return any(contains_keyword(text, k) for k in DOTA_KEYWORDS)
 
 
 def get_event_category(event):
+    if is_dota_event(event):
+        return None
+
+    slugs = event_tag_slugs(event)
+
+    for category, tags in CATEGORY_TAGS.items():
+        prefixes = CATEGORY_TAG_PREFIXES.get(category, ())
+        if slugs & tags or (prefixes and any(s.startswith(prefixes) for s in slugs)):
+            return category
+
     text = event_text(event)
 
     for category, keywords in CATEGORIES.items():
-        if any(k in text for k in keywords):
+        if category == "Fußball" and any(contains_keyword(text, k) for k in NON_SOCCER_KEYWORDS):
+            continue
+        if any(contains_keyword(text, k) for k in keywords):
             return category
 
     return None
 
 
-def get_events(limit=100, max_pages=20):
-    events_by_id = {}
+def get_tournament_rejection(event):
+    """None, wenn das Event ein Turnier-Markt ist, sonst der Ausschlussgrund."""
+    tag_ids = {str(tag.get("id")) for tag in event_tags(event)}
+    if str(GAMES_TAG_ID) in tag_ids or "games" in event_tag_slugs(event):
+        return "Einzelspiel (Gamma-Tag 'Games')"
+
+    title = normalize_text(event.get("title", ""))
+
+    for keyword in EXCLUDE_KEYWORDS:
+        if contains_keyword(title, keyword):
+            return f"Ausschluss-Keyword im Titel: '{keyword.strip()}'"
+
+    if not any(contains_keyword(title, k) for k in TOURNAMENT_WORDS):
+        return "kein Turnier-Keyword im Titel"
+
+    return None
+
+
+# =====================
+# Diagnose
+# =====================
+
+REJECT_INVALID_PRICES = "invalid_prices"
+REJECT_INCOMPLETE = "incomplete"
+REJECT_BELOW_ROI = "below_roi"
+REJECT_OTHER = "other"
+
+MAX_REJECTION_LOG_LINES = 300
+
+
+class ScanStats:
+    def __init__(self):
+        self.api_events_loaded = 0
+        self.unique_events = 0
+        self.discovery_queries = 0
+        self.discovery_errors = []
+        self.dota_excluded = 0
+        self.category_matches = Counter()
+        self.non_tournament = Counter()
+        self.tournament_events = Counter()
+        self.rejections = Counter()
+        self.rejected_events = []
+        self.market_exclusions = Counter()
+        self.opportunity_events = 0
+        self.opportunity_rows = 0
+        self.guaranteed_events = 0
+        self.full_set_arbitrage_events = 0
+        self.sheet_rows_written = None
+        self.duration_seconds = None
+
+    def reject(self, category, event, group, reason):
+        self.rejections[group] += 1
+        self.rejected_events.append((category, event.get("title"), event.get("slug"), reason))
+
+    def summary_lines(self):
+        lines = [
+            "========== SCANNER DEBUG ==========",
+            "",
+            f"API Events Loaded: {self.api_events_loaded} ({self.discovery_queries} Discovery-Abfragen)",
+            f"Unique Events: {self.unique_events}",
+            f"Discovery Errors: {len(self.discovery_errors)}",
+        ]
+        lines += [f"  - {err}" for err in self.discovery_errors]
+        lines += [
+            f"Dota 2 Excluded: {self.dota_excluded}",
+            f"Category Matches (vor Turnier-Filter): {sum(self.category_matches.values())}",
+            f"Not Tournament Markets: {sum(self.non_tournament.values())}",
+        ]
+        lines += [f"  - {reason}: {n}" for reason, n in self.non_tournament.most_common()]
+        lines += [
+            "",
+            f"Tournament Events Detected: {sum(self.tournament_events.values())}",
+            "",
+        ]
+        lines += [f"{cat}: {self.tournament_events.get(cat, 0)}" for cat in CATEGORIES]
+        lines += [
+            "",
+            "Excluded Markets: " + (", ".join(
+                f"{status}={n}" for status, n in sorted(self.market_exclusions.items())
+            ) or "0"),
+            f"Events With Invalid Prices: {self.rejections[REJECT_INVALID_PRICES]}",
+            f"Events With Incomplete Outcomes: {self.rejections[REJECT_INCOMPLETE]}",
+            f"Events Below ROI Threshold: {self.rejections[REJECT_BELOW_ROI]}",
+            f"Events Excluded By Other Filters: {self.rejections[REJECT_OTHER]}",
+            "",
+            f"Valid Opportunities: {self.opportunity_events} Events / {self.opportunity_rows} Zeilen",
+            f"  davon vollständiges Set (garantiert, theoretisch): {self.guaranteed_events}",
+            f"Full-Set Arbitrage (alle Outcomes < 1, Set vollständig): {self.full_set_arbitrage_events}",
+            "Google Sheets Rows Written: "
+            + ("nicht geschrieben" if self.sheet_rows_written is None else str(self.sheet_rows_written)),
+        ]
+        if self.duration_seconds is not None:
+            lines.append(f"Scan-Dauer: {self.duration_seconds:.1f}s")
+        lines += ["", "==================================="]
+        return lines
+
+    def print_rejections(self):
+        if not self.rejected_events:
+            return
+        print(f"Abgelehnte Turnier-Events ({len(self.rejected_events)}):", flush=True)
+        for category, title, slug, reason in self.rejected_events[:MAX_REJECTION_LOG_LINES]:
+            print(f"  [REJECT] {category} | {title} ({slug}) | {reason}", flush=True)
+        hidden = len(self.rejected_events) - MAX_REJECTION_LOG_LINES
+        if hidden > 0:
+            print(f"  ... {hidden} weitere ausgeblendet", flush=True)
+
+    def print_summary(self):
+        print("\n".join(self.summary_lines()), flush=True)
+
+
+# =====================
+# Gamma API
+# =====================
+
+HTTP = requests.Session()
+# /events-Seiten mit limit > 50 liefert Gamma nur gzip-komprimiert aus.
+HTTP.headers.update({"Accept-Encoding": "gzip, deflate"})
+
+
+def gamma_get(url, params, timeout=30, retries=2):
+    for attempt in range(retries + 1):
+        try:
+            response = HTTP.get(url, params=params, timeout=timeout)
+        except requests.RequestException:
+            if attempt < retries:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+
+        if response.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+            time.sleep(2 ** attempt)
+            continue
+
+        return response
+
+
+def fetch_event_query(label, params, limit, max_pages, stats):
+    """Lädt eine Discovery-Abfrage per Keyset-Pagination (Fallback: offset bis MAX_OFFSET).
+
+    Gibt (events, ok) zurück; ok=False bei API-/Netzwerkfehler.
+    """
+    events = []
+    cursor = None
+    offset = 0
+    use_keyset = True
 
     for page in range(max_pages):
-        params = {
-            "active": "true",
-            "closed": "false",
-            "limit": limit,
-            "offset": page * limit,
-        }
-
-        print(f"Lade Event-Seite {page + 1} ...", flush=True)
+        if use_keyset:
+            url = EVENTS_KEYSET_URL
+            query = {**params, "closed": "false", "limit": limit}
+            if cursor:
+                query["after_cursor"] = cursor
+        else:
+            if offset > MAX_OFFSET:
+                break
+            url = EVENTS_URL
+            query = {**params, "active": "true", "closed": "false", "limit": limit, "offset": offset}
 
         try:
-            r = requests.get(
-                EVENTS_URL,
-                params=params,
-                timeout=30
-            )
+            response = gamma_get(url, query)
+            if response.status_code != 200:
+                if use_keyset and page == 0:
+                    print(
+                        f"  {label}: Keyset-Endpoint Fehler {response.status_code} – "
+                        f"Fallback auf offset-Pagination",
+                        flush=True,
+                    )
+                    use_keyset = False
+                    response = gamma_get(EVENTS_URL, {
+                        **params, "active": "true", "closed": "false", "limit": limit, "offset": 0,
+                    })
+                if response.status_code != 200:
+                    raise ValueError(f"HTTP {response.status_code}: {response.text[:300]}")
+            data = response.json()
+        except (requests.RequestException, ValueError) as e:
+            stats.discovery_errors.append(f"{label} (Seite {page + 1}): {e}")
+            print(f"  Gamma API Fehler bei {label}, Seite {page + 1}: {e}", flush=True)
+            return events, False
 
-            if r.status_code != 200:
-                print(
-                    f"Gamma API Fehler {r.status_code}: "
-                    f"{r.text[:500]}",
-                    flush=True
-                )
-                break
+        if isinstance(data, dict):
+            batch = data.get("events") or []
+            cursor = data.get("next_cursor")
+        else:
+            batch = data if isinstance(data, list) else []
+            cursor = None
 
-            batch = r.json()
+        events.extend(batch)
 
-        except requests.RequestException as e:
-            print(f"Netzwerkfehler beim Laden der Events: {e}", flush=True)
+        if not batch or len(batch) < limit:
             break
-        except ValueError as e:
-            print(f"Ungültige JSON-Antwort: {e}", flush=True)
+        if use_keyset and not cursor:
             break
+        offset += limit
 
-        print(
-            f"  Seite {page + 1}: {len(batch)} Events",
-            flush=True
-        )
+    return events, True
 
-        if not batch:
-            break
 
+def get_events(limit=EVENT_LIMIT, max_pages=MAX_PAGES, stats=None):
+    """Turnier-Discovery: Tag-Abfragen (ohne Einzelspiele) + Top-Events nach 24h-Volumen.
+
+    Ein ungefilterter offset-Scan sieht nur die ältesten ~2000 der >19.000 offenen Events
+    (Gamma sortiert ohne `order` nach ID, offset > 2000 liefert HTTP 422).
+    """
+    stats = stats if stats is not None else ScanStats()
+
+    queries = [
+        (f"Tag '{slug}'", {"tag_slug": slug, "exclude_tag_id": GAMES_TAG_ID}, max_pages)
+        for slug in DISCOVERY_TAG_SLUGS
+    ]
+    queries.append(("Top 24h-Volumen", {"order": "volume24hr", "ascending": "false"}, GENERAL_SCAN_PAGES))
+
+    events_by_id = {}
+    successful = 0
+
+    for label, params, pages in queries:
+        batch, ok = fetch_event_query(label, params, limit, pages, stats)
+        stats.discovery_queries += 1
+        stats.api_events_loaded += len(batch)
+        successful += int(ok)
+
+        new = 0
         for event in batch:
             event_id = event.get("id") or event.get("slug")
-
-            if event_id:
+            if event_id and event_id not in events_by_id:
                 events_by_id[event_id] = event
+                new += 1
 
-        if len(batch) < limit:
-            break
+        print(f"  {label}: {len(batch)} Events ({new} neu)", flush=True)
+
+    if successful == 0:
+        raise RuntimeError(
+            "Gamma API: keine Discovery-Abfrage erfolgreich – Abbruch, "
+            "damit bestehende Google-Sheets-Daten nicht überschrieben werden."
+        )
 
     events = list(events_by_id.values())
+    stats.unique_events = len(events)
 
-    print(
-        f"Insgesamt eindeutige Events geladen: {len(events)}",
-        flush=True
-    )
+    print(f"Insgesamt eindeutige Events geladen: {len(events)}", flush=True)
 
     return events
 
@@ -229,15 +524,200 @@ def get_yes_price(market):
         return None
 
     for outcome, price in zip(outcomes, prices):
-        if str(outcome).lower() == "yes":
-            try:
-                price = float(price)
-                if price >= 0:
-                    return price
-            except Exception:
-                return None
+        if str(outcome).strip().lower() == "yes":
+            price = to_float(price)
+            if price is not None and 0 <= price <= 1:
+                return price
+            return None
 
     return None
+
+
+ARB_GUARANTEED = "Vollständig – garantiert (theoretisch)"
+ARB_ALL_LIVE = "Alle handelbaren Outcomes – Platzhalter offen (nicht garantiert)"
+ARB_SUBSET = f"Top {TOP_N} Teilmenge – nicht garantiert"
+
+MARKET_LIVE = "live"
+MARKET_CLOSED = "geschlossen"
+MARKET_PLACEHOLDER = "platzhalter_inaktiv"
+MARKET_NOT_ACCEPTING = "keine_orders"
+MARKET_INVALID_PRICE = "ungueltiger_preis"
+MARKET_UNPRICED = "ohne_preis"
+MARKET_OTHER_UNSTABLE = "other_variabel"
+
+UNTRADABLE_STATUSES = (
+    MARKET_PLACEHOLDER, MARKET_NOT_ACCEPTING, MARKET_INVALID_PRICE, MARKET_UNPRICED,
+    MARKET_OTHER_UNSTABLE,
+)
+
+
+def has_price_discovery(market):
+    """False für aktive Märkte ohne Bid, ohne Trade und ohne Volumen.
+
+    Gamma meldet dort den Mittelwert des leeren Orderbuchs (z.B. 0.495) als outcomePrice.
+    """
+    volume = to_float(market.get("volumeNum"))
+    if volume is None:
+        volume = to_float(market.get("volume"))
+    return any(
+        (value or 0) > 0
+        for value in (
+            to_float(market.get("bestBid")),
+            to_float(market.get("lastTradePrice")),
+            volume,
+        )
+    )
+
+
+def classify_market(market):
+    price = get_yes_price(market)
+
+    if market.get("closed") is True:
+        return MARKET_CLOSED, price
+    # Inaktive negRisk-Platzhalter ("Other", "Team H", ...) haben den Dummy-Preis 0.5.
+    if market.get("active") is False:
+        return MARKET_PLACEHOLDER, price
+    if market.get("acceptingOrders") is False:
+        return MARKET_NOT_ACCEPTING, price
+    if price is None:
+        return MARKET_INVALID_PRICE, None
+    if not has_price_discovery(market):
+        return MARKET_UNPRICED, price
+    return MARKET_LIVE, price
+
+
+def is_mutually_exclusive(event):
+    if event.get("negRisk") is True:
+        return True
+    markets = event.get("markets") or []
+    return bool(markets) and all(m.get("negRisk") is True for m in markets)
+
+
+def market_name(market):
+    return market.get("question") or market.get("title") or market.get("slug")
+
+
+def evaluate_event(event, top_n=TOP_N, min_roi=MIN_RAW_ROI):
+    """Bewertet ein Turnier-Event anhand der theoretischen YES-Preise (outcomePrices).
+
+    Ergebnis-Dict: ok, group, reason, market_counts und bei ok zusätzlich
+    top_teams, top_sum, roi, live_count, untradable_count, full_sum, arbitrage_type.
+    """
+    result = {"ok": False, "group": REJECT_OTHER, "reason": "", "market_counts": Counter()}
+
+    if not is_mutually_exclusive(event):
+        result["reason"] = (
+            "Outcomes nicht gegenseitig ausschließend (negRisk=false) – "
+            "Summe der YES-Preise ergibt keinen Arbitrage-Basket"
+        )
+        return result
+
+    counts = result["market_counts"]
+    live = []
+    resolved_yes = None
+    seen_markets = set()
+
+    for market in event.get("markets") or []:
+        market_key = market.get("id") or market.get("conditionId") or market.get("slug")
+        if market_key in seen_markets:
+            continue
+        seen_markets.add(market_key)
+
+        status, price = classify_market(market)
+        counts[status] += 1
+
+        if status == MARKET_CLOSED and price is not None and price >= RESOLVED_YES_PRICE:
+            resolved_yes = market
+        elif status == MARKET_LIVE:
+            live.append({"team": market_name(market), "price": price, "market": market})
+
+    if resolved_yes is not None:
+        result["reason"] = f"Event bereits entschieden: {market_name(resolved_yes)}"
+        return result
+
+    # Augmented negRisk: solange Platzhalter offen sind, ändert sich die Definition des
+    # expliziten "Other"-Outcomes, wenn Platzhalter benannt werden (Polymarket-Doku).
+    if counts[MARKET_PLACEHOLDER]:
+        unstable = [t for t in live if t["market"].get("negRiskOther") is True]
+        if unstable:
+            live = [t for t in live if t["market"].get("negRiskOther") is not True]
+            counts[MARKET_LIVE] -= len(unstable)
+            counts[MARKET_OTHER_UNSTABLE] += len(unstable)
+
+    untradable = sum(counts[s] for s in UNTRADABLE_STATUSES)
+
+    if not live:
+        result["group"] = REJECT_INVALID_PRICES
+        result["reason"] = (
+            f"keine handelbaren Outcomes mit gültigem YES-Preis "
+            f"({counts[MARKET_PLACEHOLDER]} Platzhalter, {counts[MARKET_UNPRICED]} ohne Preis, "
+            f"{counts[MARKET_INVALID_PRICE]} ungültig, {counts[MARKET_CLOSED]} geschlossen)"
+        )
+        return result
+
+    complete = untradable == 0
+    full_sum = sum(t["price"] for t in live)
+
+    if not complete and full_sum < MIN_LIVE_PROBABILITY_SUM:
+        result["group"] = REJECT_INCOMPLETE
+        result["reason"] = (
+            f"unvollständige Outcomes: {len(live)} handelbare Outcomes summieren nur "
+            f"{full_sum:.4f} < {MIN_LIVE_PROBABILITY_SUM}, {untradable} nicht handelbar "
+            f"(Platzhalter/ohne Preis)"
+        )
+        return result
+
+    if len(live) < 2 or (len(live) < top_n and not complete):
+        result["group"] = REJECT_INCOMPLETE
+        result["reason"] = (
+            f"nur {len(live)} handelbare Outcomes (< {top_n}) und Set nicht vollständig "
+            f"({untradable} nicht handelbar)"
+            if not complete else
+            f"nur {len(live)} handelbares Outcome"
+        )
+        return result
+
+    live.sort(key=lambda t: t["price"], reverse=True)
+    top_teams = live[:top_n]
+    top_sum = sum(t["price"] for t in top_teams)
+
+    if top_sum <= 0:
+        result["group"] = REJECT_INVALID_PRICES
+        result["reason"] = f"Summe Top {len(top_teams)} = 0"
+        return result
+
+    roi = (1 / top_sum) - 1
+    covers_all_live = len(top_teams) == len(live)
+
+    if covers_all_live and complete:
+        arbitrage_type = ARB_GUARANTEED
+    elif covers_all_live:
+        arbitrage_type = ARB_ALL_LIVE
+    else:
+        arbitrage_type = ARB_SUBSET
+
+    result.update({
+        "top_teams": top_teams,
+        "top_sum": top_sum,
+        "roi": roi,
+        "live_count": len(live),
+        "untradable_count": untradable,
+        "full_sum": full_sum,
+        "complete": complete,
+        "arbitrage_type": arbitrage_type,
+    })
+
+    if roi < min_roi:
+        result["group"] = REJECT_BELOW_ROI
+        result["reason"] = (
+            f"ROI {roi * 100:.2f}% < {min_roi * 100:.2f}% "
+            f"(Summe Top {len(top_teams)} = {top_sum:.4f})"
+        )
+        return result
+
+    result["ok"] = True
+    result["group"] = None
+    return result
 
 
 def connect_google_sheet():
@@ -272,21 +752,33 @@ def write_dataframe_to_sheet(ws, df):
 
     if df.empty:
         ws.update(values=[["Keine passenden Spots gefunden."]], range_name="A1")
-        return
+        return 0
 
     values = [df.columns.tolist()] + df.astype(str).values.tolist()
     ws.update(values=values, range_name="A1")
+    return len(values) - 1
+
+
+def column_letter(index):
+    letters = ""
+    index += 1
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
 
 
 # =====================
 # Google Sheets Format
 # =====================
 
-def format_google_sheet(ws):
+def format_google_sheet(ws, num_cols=12):
+    last_col = column_letter(max(num_cols, 12) - 1)
+
     ws.freeze(rows=1)
     ws.set_basic_filter()
 
-    ws.format("A1:L1", {
+    ws.format(f"A1:{last_col}1", {
         "backgroundColor": {"red": 0.12, "green": 0.31, "blue": 0.47},
         "textFormat": {
             "foregroundColor": {"red": 1, "green": 1, "blue": 1},
@@ -295,20 +787,21 @@ def format_google_sheet(ws):
         "horizontalAlignment": "CENTER",
     })
 
-    ws.format("A:L", {
+    ws.format(f"A:{last_col}", {
         "verticalAlignment": "MIDDLE",
         "wrapStrategy": "WRAP",
     })
 
-    ws.format("E:F", {
+    # F = YES Preis, G = Summe Top N, H = ROI %, I:K = Stake / Payout / Profit
+    ws.format("F:G", {
         "numberFormat": {"type": "NUMBER", "pattern": "0.0000"}
     })
 
-    ws.format("G:G", {
+    ws.format("H:H", {
         "numberFormat": {"type": "NUMBER", "pattern": "0.00"}
     })
 
-    ws.format("H:J", {
+    ws.format("I:K", {
         "numberFormat": {"type": "CURRENCY", "pattern": "$0.00"}
     })
 
@@ -347,6 +840,8 @@ def color_events_and_roi(ws, df):
     if df.empty:
         return
 
+    num_cols = len(df.columns)
+    roi_col = df.columns.get_loc("ROI %")
     requests = []
 
     event_colors = [
@@ -372,7 +867,7 @@ def color_events_and_roi(ws, df):
                     "startRowIndex": row_index,
                     "endRowIndex": row_index + 1,
                     "startColumnIndex": 0,
-                    "endColumnIndex": 12,
+                    "endColumnIndex": num_cols,
                 },
                 "cell": {
                     "userEnteredFormat": {
@@ -390,8 +885,8 @@ def color_events_and_roi(ws, df):
                     "sheetId": ws.id,
                     "startRowIndex": 1,
                     "endRowIndex": len(df) + 1,
-                    "startColumnIndex": 6,
-                    "endColumnIndex": 7,
+                    "startColumnIndex": roi_col,
+                    "endColumnIndex": roi_col + 1,
                 }],
                 "booleanRule": {
                     "condition": {
@@ -445,10 +940,10 @@ def format_history_summary(ws):
         try:
             roi = float(row[5])  # ROI %
             top_sum = float(row[6])  # Summe Top 5
-        except:
+        except (ValueError, IndexError):
             continue
 
-    # ROI Farben
+        # ROI Farben
         if roi > 10:
             color = {"red": 0.70, "green": 0.90, "blue": 0.70}
         elif roi > 5:
@@ -456,29 +951,29 @@ def format_history_summary(ws):
         else:
             color = None
 
-    # Strong Edge überschreibt
-    if top_sum < 0.90:
-        color = {"red": 0.65, "green": 0.85, "blue": 1.00}
+        # Strong Edge überschreibt
+        if top_sum < 0.90:
+            color = {"red": 0.65, "green": 0.85, "blue": 1.00}
 
-    if color:
-        requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws.id,
-                    "startRowIndex": i,
-                    "endRowIndex": i + 1,
-                    "startColumnIndex": 5,
-                    "endColumnIndex": 7,
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": color,
-                        "textFormat": {"bold": True}
-                    }
-                },
-                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat",
-            }
-        })
+        if color:
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": i,
+                        "endRowIndex": i + 1,
+                        "startColumnIndex": 5,
+                        "endColumnIndex": 7,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": color,
+                            "textFormat": {"bold": True}
+                        }
+                    },
+                    "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat",
+                }
+            })
 
     if requests:
         ws.spreadsheet.batch_update({"requests": requests})
@@ -487,70 +982,79 @@ def format_history_summary(ws):
 # Scanner
 # =====================
 
-def build_opportunities():
+def build_opportunities(events=None, stats=None):
+    stats = stats if stats is not None else ScanStats()
+    started = time.time()
     rows = []
 
-    events = get_events()
+    if events is None:
+        events = get_events(stats=stats)
+    else:
+        stats.unique_events = len(events)
+
     print(f"Events geladen: {len(events)}")
 
-    target_events = []
+    seen_slugs = set()
+    scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    for e in events:
-        category = get_event_category(e)
-        if category:
-            e["_scanner_category"] = category
-            target_events.append(e)
-
-    print(f"Turnier-Events gefunden: {len(target_events)}")
-
-    for event in target_events:
-        markets = event.get("markets", [])
-        team_prices = []
-
-        for market in markets:
-            yes_price = get_yes_price(market)
-
-            if yes_price is None:
-                continue
-
-            team_name = (
-                market.get("question")
-                or market.get("title")
-                or market.get("slug")
-            )
-
-            team_prices.append({
-                "team": team_name,
-                "price": yes_price,
-                "market": market,
-            })
-
-        if len(team_prices) < TOP_N:
+    for event in events:
+        if is_dota_event(event):
+            stats.dota_excluded += 1
             continue
 
-        team_prices.sort(key=lambda x: x["price"], reverse=True)
-        top_teams = team_prices[:TOP_N]
+        category = get_event_category(event)
+        if not category:
+            continue
+        stats.category_matches[category] += 1
 
-        yes_sum = sum(t["price"] for t in top_teams)
-
-        if yes_sum <= 0:
+        not_tournament = get_tournament_rejection(event)
+        if not_tournament:
+            stats.non_tournament[not_tournament] += 1
             continue
 
-        roi = (1 / yes_sum) - 1
+        slug = event.get("slug") or event.get("id")
+        if slug in seen_slugs:
+            stats.reject(category, event, REJECT_OTHER, "Duplikat (Slug bereits verarbeitet)")
+            continue
+        seen_slugs.add(slug)
 
-        if roi < MIN_RAW_ROI:
+        event["_scanner_category"] = category
+        stats.tournament_events[category] += 1
+
+        if event.get("closed") is True or event.get("active") is False:
+            stats.reject(category, event, REJECT_OTHER, "Event geschlossen oder inaktiv")
             continue
 
+        evaluation = evaluate_event(event)
+
+        for status, n in evaluation["market_counts"].items():
+            if status != MARKET_LIVE:
+                stats.market_exclusions[status] += n
+
+        if evaluation.get("complete") and evaluation.get("full_sum", 1) < 1:
+            stats.full_set_arbitrage_events += 1
+
+        if not evaluation["ok"]:
+            stats.reject(category, event, evaluation["group"], evaluation["reason"])
+            continue
+
+        top_teams = evaluation["top_teams"]
+        yes_sum = evaluation["top_sum"]
+        roi = evaluation["roi"]
         payout = BANKROLL / yes_sum
         profit = payout - BANKROLL
+
+        stats.opportunity_events += 1
+        if evaluation["arbitrage_type"] == ARB_GUARANTEED:
+            stats.guaranteed_events += 1
 
         for t in top_teams:
             price = t["price"]
             stake = (price / yes_sum) * BANKROLL
 
             rows.append({
-                "Zeit": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "Kategorie": event.get("_scanner_category"),
+                "Zeit": scan_time,
+                "Kategorie": category,
                 "Event": event.get("title"),
                 "Event Slug": event.get("slug"),
                 "Team / Markt": t["team"],
@@ -561,12 +1065,27 @@ def build_opportunities():
                 "Payout $": round(payout, 2),
                 "Profit $": round(profit, 2),
                 "Link": "https://polymarket.com/event/" + str(event.get("slug", "")),
+                "Handelbare Outcomes": evaluation["live_count"],
+                "Nicht handelbare Outcomes": evaluation["untradable_count"],
+                "Summe alle YES": round(evaluation["full_sum"], 4),
+                "Arbitrage-Typ": evaluation["arbitrage_type"],
             })
 
     df = pd.DataFrame(rows)
 
     if not df.empty:
-        df = df.sort_values(by=["ROI %", "Event"], ascending=[False, True])
+        df = df.drop_duplicates(subset=["Event Slug", "Team / Markt"], keep="first")
+        df = df.sort_values(
+            by=["ROI %", "Event", "YES Preis"],
+            ascending=[False, True, False],
+            kind="mergesort",
+        ).reset_index(drop=True)
+
+    stats.opportunity_rows = len(df)
+    stats.duration_seconds = time.time() - started
+
+    print(f"Turnier-Events gefunden: {sum(stats.tournament_events.values())}")
+    stats.print_rejections()
 
     return df
 
@@ -1118,12 +1637,16 @@ def detect_resolved_winner(event):
     markets = event.get("markets", [])
 
     for market in markets:
+        # Nur aufgelöste Märkte: ein offener Favorit bei 0.98 ist noch kein Gewinner.
+        if market.get("closed") is not True:
+            continue
+
         yes_price = get_yes_price(market)
 
         if yes_price is None:
             continue
 
-        if yes_price >= 0.98:
+        if yes_price >= RESOLVED_YES_PRICE:
             return (
                 market.get("question")
                 or market.get("title")
@@ -1195,44 +1718,53 @@ def resolve_history_results(sheet):
 
 def main():
     print("Starte Polymarket Scanner...")
+    stats = ScanStats()
 
-    df = build_opportunities()
-    print("Gefundene Zeilen:", len(df))
+    try:
+        # Bricht bei komplettem API-Ausfall ab, bevor Sheets/DB angefasst werden.
+        df = build_opportunities(stats=stats)
+        print("Gefundene Zeilen:", len(df))
 
-    # Datenbank
-    init_db()
-    migrate_db()
-    init_db()
-    save_outcome_to_db(df)
-    resolve_outcomes_db()
+        # Datenbank
+        init_db()
+        migrate_db()
+        init_db()
+        save_outcome_to_db(df)
+        resolve_outcomes_db()
 
-    # Google Sheet
-    sheet = connect_google_sheet()
-    print("Google Sheet geöffnet:", sheet.title)
-    update_stats_sheet_from_db(sheet)
-    update_db_outcomes_sheet(sheet)
+        # Google Sheet
+        sheet = connect_google_sheet()
+        print("Google Sheet geöffnet:", sheet.title)
+        update_stats_sheet_from_db(sheet)
+        update_db_outcomes_sheet(sheet)
 
-    opportunities_ws = get_or_create_worksheet(sheet, "Opportunities")
-    write_dataframe_to_sheet(opportunities_ws, df)
-    format_google_sheet(opportunities_ws)
-    color_events_and_roi(opportunities_ws, df)
+        opportunities_ws = get_or_create_worksheet(sheet, "Opportunities")
+        stats.sheet_rows_written = write_dataframe_to_sheet(opportunities_ws, df)
+        format_google_sheet(opportunities_ws, num_cols=len(df.columns))
+        color_events_and_roi(opportunities_ws, df)
 
-    # History / Outcome im Sheet
-    update_history_summary(sheet, df)
+        # History / Outcome im Sheet
+        update_history_summary(sheet, df)
 
-    # Status
-    status_ws = get_or_create_worksheet(sheet, "Status", rows=20, cols=5)
-    status_ws.clear()
-    status_ws.update(values=[
-        ["Letztes Update", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-        ["Gefundene Zeilen", len(df)],
-        ["Bankroll pro Spot", BANKROLL],
-        ["Top N", TOP_N],
-        ["Min ROI", MIN_RAW_ROI],
-        ["Min History ROI %", MIN_HISTORY_ROI],
-    ], range_name="A1")
+        # Status
+        status_ws = get_or_create_worksheet(sheet, "Status", rows=20, cols=5)
+        status_ws.clear()
+        status_ws.update(values=[
+            ["Letztes Update", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+            ["Gefundene Zeilen", len(df)],
+            ["Bankroll pro Spot", BANKROLL],
+            ["Top N", TOP_N],
+            ["Min ROI", MIN_RAW_ROI],
+            ["Min History ROI %", MIN_HISTORY_ROI],
+            ["Events geladen", stats.unique_events],
+            ["Turnier-Events", sum(stats.tournament_events.values())],
+            ["Opportunity-Events", stats.opportunity_events],
+            ["Discovery-Fehler", len(stats.discovery_errors)],
+        ], range_name="A1")
 
-    print("✅ Google Sheet erfolgreich aktualisiert.")
+        print("✅ Google Sheet erfolgreich aktualisiert.")
+    finally:
+        stats.print_summary()
 
 if __name__ == "__main__":
     main()
